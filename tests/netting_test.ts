@@ -1,8 +1,9 @@
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import { minimalTransfers } from "../supabase/functions/_shared/netting.ts";
 import type { NetPosition, Transfer } from "../supabase/functions/_shared/types.ts";
 
 function applyTransfers(positions: NetPosition[], transfers: Transfer[]): Map<string, number> {
+  // positions are NET balances: a debtor is negative, so a payment they send ADDS to their balance (debt shrinks); the receiver's credit shrinks.
   const net = new Map(positions.map((p) => [p.memberId, p.cents]));
   for (const t of transfers) {
     net.set(t.fromMemberId, (net.get(t.fromMemberId) ?? 0) + t.amountCents);
@@ -38,8 +39,17 @@ Deno.test("produces at most n-1 transfers", () => {
     { memberId: "d", cents: 600 },
   ];
   const transfers = minimalTransfers(positions);
+  assert(transfers.length > 0);
   assertEquals(transfers.length <= 3, true);
   for (const [, v] of applyTransfers(positions, transfers)) assertEquals(v, 0);
+});
+
+Deno.test("throws when positions do not sum to zero", () => {
+  assertThrows(
+    () => minimalTransfers([{ memberId: "a", cents: -500 }, { memberId: "b", cents: 200 }]),
+    Error,
+    "net positions must sum to zero",
+  );
 });
 
 Deno.test("all-settled positions produce no transfers", () => {
