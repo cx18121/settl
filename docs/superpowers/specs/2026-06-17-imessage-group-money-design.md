@@ -1,6 +1,6 @@
-# Tally — Design Spec
+# Settl — Design Spec
 
-*Working name: **Tally** (placeholder — decide later). An iMessage app for settling up and chasing money between friends.*
+*Working name: **Settl**. An iMessage app for settling up and chasing money between friends. (Note: an unrelated "Settl: Split" exists on the App Store, so the public store-listing name will need a tweak at submission — not blocking; this is the internal working name.)*
 
 Date: 2026-06-17 · Status: approved design, pre-implementation
 
@@ -133,6 +133,6 @@ Five tables. Net balances are **computed**, never stored.
 
 ## Open questions (not blocking)
 
-- Product name (Tally is a placeholder).
+- Product name: **Settl** is the working name; revisit the public App Store listing name at submission (collision with existing "Settl: Split").
 - Settlement confirmation: does the creditor have to confirm receipt, or does the payer's "I paid" auto-confirm? (Lean: payer marks → creditor gets a soft "confirm?" but it's not blocking.)
 - Whether the web settle page is served by a Supabase Edge Function or a tiny separate static host.
