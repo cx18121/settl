@@ -18,6 +18,7 @@
 - **The schema is the trust boundary in this phase** (auth is deferred). Every member/event/settlement reference is constrained at the DB level to belong to the *same group* via composite foreign keys — a cross-group reference must be impossible to insert, not merely avoided in code.
 - **Multi-row ledger writes are atomic.** Anything that writes an event plus its shares goes through a single Postgres function (one transaction) so a partial failure can never leave an orphan event. The service layer never writes event and shares in two separate round-trips.
 - **Settlements are validated against the current netted outstanding** — a settlement may only go from an actual debtor to its actual creditor, for an amount no greater than what's outstanding between them (partial payments allowed); confirming only ever flips a `proposed` row.
+- **`amount ≤ outstanding` is a fat-finger UX guard, not a ledger invariant.** Overpaying is economically valid (if B pays A more than B owes, A simply now owes B the difference) — net positions still sum to zero and netting still works. So a rare concurrent race that lets an overpay slip past this guard does **not** corrupt money. The one genuine corruption vector — counting the *same* payment twice — is closed for pending settlements by the `one_pending_settlement_per_pair` unique index; full idempotency for confirmed manual marks (client-supplied idempotency keys) and a per-group advisory-locked settlement RPC are **deferred to Plan 2**, where requests flow through one authenticated server path. This phase is a tested library with no concurrent callers, so that hardening is not yet load-bearing.
 - Deno standard library asserts imported from `jsr:@std/assert@1`.
 - Local Supabase is driven by the Supabase CLI (`supabase start` / `supabase stop`); migrations live in `supabase/migrations/` as timestamped SQL.
 
@@ -172,6 +173,13 @@ create index on members(group_id);
 create index on events(group_id);
 create index on shares(event_id);
 create index on settlements(group_id);
+
+-- Race backstop: at most ONE pending settlement per debtor->creditor pair.
+-- The app also checks this (nicer error), but the index makes concurrent
+-- double-proposals impossible at the DB level, not just unlikely.
+create unique index one_pending_settlement_per_pair
+  on settlements (group_id, from_member_id, to_member_id)
+  where status = 'proposed';
 ```
 
 - [ ] **Step 2: Start Supabase and apply the migration**
@@ -1029,6 +1037,7 @@ git commit -m "feat: getNettedTransfers loads group ledger and nets it"
   - `async function recordSettlement(db, input): Promise<{ settlementId: string }>` — validates the payment is real before inserting: `from→to` must be an **actual outstanding netted debt** and `amount ≤ outstanding` (partial payments allowed; overpay/wrong-direction rejected), and there must be no existing `proposed` settlement for the same pair (double-submit guard). Inserts `proposed` for Venmo (awaits the recipient's confirmation) or `confirmed` immediately for manual marks (`method !== "venmo"`).
   - `async function confirmSettlement(db, settlementId: string): Promise<void>` — flips a **`proposed`** settlement to `confirmed`; throws if no such proposed row exists (guards double-confirm / bad id).
   - Note: enforcing that the *creditor specifically* authorizes confirmation requires an authenticated caller — that lands in the auth phase (Plan 2). This task makes the operation safe against bad data; it does not yet authenticate who triggers it.
+  - Note on concurrency: the app-level `amount ≤ outstanding` and pending checks are check-then-write and could race under truly simultaneous callers. The `one_pending_settlement_per_pair` index backstops duplicate pending proposals at the DB. Fully transactional settlement (per-group advisory lock + idempotency keys) is deferred to Plan 2 — see Global Constraints for why this is bounded (overpay is economically valid, not corruption).
 
 - [ ] **Step 1: Write the failing test (append to `tests/repo_test.ts`)**
 
@@ -1184,6 +1193,8 @@ export async function recordSettlement(
   }
 
   // Double-submit guard: at most one pending settlement per from->to pair.
+  // This gives a friendly error; the `one_pending_settlement_per_pair` unique
+  // index is the real backstop that also holds under concurrent submissions.
   const { data: pending, error: pErr } = await db
     .from("settlements")
     .select("id")
@@ -1253,6 +1264,6 @@ A fully-tested money engine: equal/custom split math with exact-cent rounding, m
 
 ## Follow-on plans (not in scope here)
 
-- **Plan 2 — API + pools + claim flow:** edge-function HTTP handlers over the service layer; `createPool` (event type `pool`, everyone owes the organizer toward `target_cents`) and `createLoan` (split-of-one); member claim/self-identify; void-event endpoint.
+- **Plan 2 — API + pools + claim flow:** edge-function HTTP handlers over the service layer; `createPool` (event type `pool`, everyone owes the organizer toward `target_cents`) and `createLoan` (split-of-one); member claim/self-identify; void-event endpoint. **Also owns settlement concurrency hardening:** move settlement validation+insert into a per-group advisory-locked path (one server entry point) and add client-supplied idempotency keys so a confirmed manual mark can't be double-counted; add concurrent double-submit tests.
 - **Plan 3 — Web settle page:** token-addressed edge function returning HTML showing a member's netted amount owed + Venmo deep links.
 - **Plan 4 — iMessage extension:** SwiftUI `MSMessagesAppViewController`, split/pool entry, balance cards, message bubbles, Venmo deep-linking, drafted-reminder insertion.
