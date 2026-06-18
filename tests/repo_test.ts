@@ -79,7 +79,7 @@ Deno.test({
       .select()
       .single();
 
-    let threw = false;
+    let msg = "";
     try {
       await createSplit(db, {
         groupId,
@@ -91,10 +91,11 @@ Deno.test({
           { memberId: outsider!.id, amountCents: 1000 }, // outsider violates the composite FK
         ],
       });
-    } catch (_e) {
-      threw = true;
+    } catch (e) {
+      msg = (e as Error).message;
     }
-    assertEquals(threw, true);
+    assert(msg.includes("createSplit:"), `expected createSplit error, got: ${msg}`);
+    assert(/foreign key|violates|constraint/i.test(msg), `expected FK-violation error, got: ${msg}`);
     // the event insert must have rolled back — no orphan event left in the group
     const { data: events } = await db.from("events").select("id").eq("group_id", groupId);
     assertEquals(events!.length, 0);
