@@ -1,6 +1,6 @@
 import { assertEquals, assert } from "@std/assert";
 import { makeDb } from "../supabase/functions/_shared/db.ts";
-import { createSplit } from "../supabase/functions/_shared/repo.ts";
+import { createSplit, getNettedTransfers } from "../supabase/functions/_shared/repo.ts";
 
 async function seedGroupWithMembers(db: ReturnType<typeof makeDb>, names: string[]) {
   const { data: g } = await db.from("groups").insert({ title: "test" }).select().single();
@@ -99,5 +99,35 @@ Deno.test({
     // the event insert must have rolled back — no orphan event left in the group
     const { data: events } = await db.from("events").select("id").eq("group_id", groupId);
     assertEquals(events!.length, 0);
+  },
+});
+
+Deno.test({
+  name: "getNettedTransfers returns who-pays-whom for a group",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, members } = await seedGroupWithMembers(db, ["A", "B", "C"]);
+    const [a, b, c] = members;
+    // A pays 30, split B/C 15 each → B owes A 15, C owes A 15
+    await createSplit(db, {
+      groupId,
+      title: "Dinner",
+      totalCents: 3000,
+      payerMemberId: a.id,
+      shares: [
+        { memberId: b.id, amountCents: 1500 },
+        { memberId: c.id, amountCents: 1500 },
+      ],
+    });
+
+    const transfers = await getNettedTransfers(db, groupId);
+    // both debtors pay A; 2 transfers, each 1500, all to A
+    assertEquals(transfers.length, 2);
+    for (const t of transfers) {
+      assertEquals(t.toMemberId, a.id);
+      assertEquals(t.amountCents, 1500);
+    }
   },
 });
