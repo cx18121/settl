@@ -15,6 +15,9 @@
 - **Events are immutable** — never UPDATE an event's amounts; "editing" = mark `voided = true` and create a new event. Voided events are excluded from all balance math.
 - **Only `confirmed` settlements affect balances.** `proposed` settlements do not.
 - **Net positions of a group always sum to zero** — this is a test invariant, not just a goal.
+- **The schema is the trust boundary in this phase** (auth is deferred). Every member/event/settlement reference is constrained at the DB level to belong to the *same group* via composite foreign keys — a cross-group reference must be impossible to insert, not merely avoided in code.
+- **Multi-row ledger writes are atomic.** Anything that writes an event plus its shares goes through a single Postgres function (one transaction) so a partial failure can never leave an orphan event. The service layer never writes event and shares in two separate round-trips.
+- **Settlements are validated against the current netted outstanding** — a settlement may only go from an actual debtor to its actual creditor, for an amount no greater than what's outstanding between them (partial payments allowed); confirming only ever flips a `proposed` row.
 - Deno standard library asserts imported from `jsr:@std/assert@1`.
 - Local Supabase is driven by the Supabase CLI (`supabase start` / `supabase stop`); migrations live in `supabase/migrations/` as timestamped SQL.
 
@@ -119,7 +122,9 @@ create table members (
   venmo_handle text,
   device_id text,
   claimed boolean not null default false,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- target for composite FKs that pin a reference to this member's group
+  unique (id, group_id)
 );
 
 create table events (
@@ -128,29 +133,39 @@ create table events (
   type text not null check (type in ('split','pool','loan','order')),
   title text,
   total_cents bigint not null check (total_cents >= 0),
-  payer_member_id uuid not null references members(id),
+  payer_member_id uuid not null,
   target_cents bigint check (target_cents >= 0),
   voided boolean not null default false,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  unique (id, group_id),
+  -- payer must belong to THIS event's group
+  foreign key (payer_member_id, group_id) references members(id, group_id)
 );
 
 create table shares (
   id uuid primary key default gen_random_uuid(),
-  event_id uuid not null references events(id) on delete cascade,
-  member_id uuid not null references members(id),
+  event_id uuid not null,
+  group_id uuid not null,
+  member_id uuid not null,
   amount_cents bigint not null check (amount_cents >= 0),
-  paid boolean not null default false
+  paid boolean not null default false,
+  -- event and member must both belong to the same group as this share
+  foreign key (event_id, group_id) references events(id, group_id) on delete cascade,
+  foreign key (member_id, group_id) references members(id, group_id)
 );
 
 create table settlements (
   id uuid primary key default gen_random_uuid(),
   group_id uuid not null references groups(id) on delete cascade,
-  from_member_id uuid not null references members(id),
-  to_member_id uuid not null references members(id),
+  from_member_id uuid not null,
+  to_member_id uuid not null,
   amount_cents bigint not null check (amount_cents > 0),
   method text not null check (method in ('venmo','apple_cash','cash','other')),
   status text not null default 'proposed' check (status in ('proposed','confirmed')),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- both parties must belong to THIS settlement's group
+  foreign key (from_member_id, group_id) references members(id, group_id),
+  foreign key (to_member_id, group_id) references members(id, group_id)
 );
 
 create index on members(group_id);
@@ -172,7 +187,7 @@ Expected: `supabase start` prints local API URL + anon/service keys; `migration 
 
 Create `tests/schema_test.ts`:
 ```ts
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { createClient } from "@supabase/supabase-js";
 
 const url = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
@@ -185,6 +200,25 @@ Deno.test("core tables exist and are queryable", async () => {
     assertEquals(error, null, `table ${table} should be queryable`);
   }
 });
+
+Deno.test("cross-group payer reference is rejected by the schema", async () => {
+  const db = createClient(url, key);
+  const { data: g1 } = await db.from("groups").insert({ title: "g1" }).select().single();
+  const { data: g2 } = await db.from("groups").insert({ title: "g2" }).select().single();
+  const { data: m1 } = await db
+    .from("members")
+    .insert({ group_id: g1!.id, display_name: "A" })
+    .select()
+    .single();
+  // an event in g2 whose payer belongs to g1 must violate the composite FK
+  const { error } = await db.from("events").insert({
+    group_id: g2!.id,
+    type: "split",
+    total_cents: 100,
+    payer_member_id: m1!.id,
+  });
+  assert(error !== null, "cross-group payer insert should fail");
+});
 ```
 
 - [ ] **Step 4: Run the test with the local service key**
@@ -193,7 +227,7 @@ Run (substitute the service_role key printed by `supabase start`, or read it fro
 ```bash
 SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/schema_test.ts --allow-env --allow-net
 ```
-Expected: PASS (1 test).
+Expected: PASS (2 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -652,19 +686,20 @@ git commit -m "feat: net-position balance computation"
 
 ---
 
-### Task 7: Service layer — create a split event in the DB
+### Task 7: Service layer — create a split event atomically
 
 **Files:**
+- Create: `supabase/migrations/0002_create_split.sql` (atomic event+shares Postgres function)
 - Create: `supabase/functions/_shared/db.ts`
 - Create: `supabase/functions/_shared/repo.ts`
 - Test: `tests/repo_test.ts`
 
 **Interfaces:**
-- Consumes: `equalSplit`, `assertSharesSumTo` (Task 3/4), `@supabase/supabase-js`.
+- Consumes: `assertSharesSumTo` (Task 4), `@supabase/supabase-js`.
 - Produces:
   - `function makeDb(): SupabaseClient` (reads `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` from env)
   - `interface CreateSplitInput { groupId: string; title: string | null; totalCents: number; payerMemberId: string; shares: { memberId: string; amountCents: number }[] }`
-  - `async function createSplit(db, input: CreateSplitInput): Promise<{ eventId: string }>` — validates shares sum to total, inserts one `events` row (type `split`) and its `shares` rows.
+  - `async function createSplit(db, input: CreateSplitInput): Promise<{ eventId: string }>` — pre-validates shares sum to total (fast client check), then calls the `create_split` Postgres function which writes the event **and** its shares in **one transaction**. The DB function re-validates the sum (backstop) and inserts `shares` carrying `group_id`; the composite FKs reject any cross-group member, and because it's one transaction a share failure rolls back the event (no orphan).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -725,6 +760,38 @@ Deno.test("createSplit rejects shares that do not sum to total", async () => {
   }
   assertEquals(threw, true);
 });
+
+Deno.test("createSplit is atomic: a cross-group member rolls back the whole event", async () => {
+  const db = makeDb();
+  const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
+  // a member that belongs to a DIFFERENT group
+  const { data: other } = await db.from("groups").insert({ title: "other" }).select().single();
+  const { data: outsider } = await db
+    .from("members")
+    .insert({ group_id: other!.id, display_name: "X" })
+    .select()
+    .single();
+
+  let threw = false;
+  try {
+    await createSplit(db, {
+      groupId,
+      title: "Cross",
+      totalCents: 2000,
+      payerMemberId: members[0].id,
+      shares: [
+        { memberId: members[1].id, amountCents: 1000 },
+        { memberId: outsider!.id, amountCents: 1000 }, // outsider violates the composite FK
+      ],
+    });
+  } catch (_e) {
+    threw = true;
+  }
+  assertEquals(threw, true);
+  // the event insert must have rolled back — no orphan event left in the group
+  const { data: events } = await db.from("events").select("id").eq("group_id", groupId);
+  assertEquals(events!.length, 0);
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -732,7 +799,51 @@ Deno.test("createSplit rejects shares that do not sum to total", async () => {
 Run: `deno test tests/repo_test.ts --allow-env --allow-net --allow-read` (with the `SUPABASE_SERVICE_ROLE_KEY` env set as in Task 2 Step 4)
 Expected: FAIL — cannot find module `db.ts`.
 
-- [ ] **Step 3: Write the db client and repo**
+- [ ] **Step 3a: Write the atomic `create_split` Postgres function**
+
+Create `supabase/migrations/0002_create_split.sql`:
+```sql
+-- Atomic: inserts the event and ALL its shares in one transaction.
+-- A share failure (e.g. cross-group member tripping a composite FK) rolls
+-- back the event, so an orphan event can never remain.
+create function create_split(
+  p_group_id uuid,
+  p_title text,
+  p_total_cents bigint,
+  p_payer_member_id uuid,
+  p_shares jsonb
+) returns uuid
+language plpgsql
+as $$
+declare
+  v_event_id uuid;
+  v_sum bigint;
+begin
+  select coalesce(sum((s->>'amount_cents')::bigint), 0)
+    into v_sum
+    from jsonb_array_elements(p_shares) as s;
+  if v_sum <> p_total_cents then
+    raise exception 'shares must sum to total: got %, expected %', v_sum, p_total_cents
+      using errcode = 'check_violation';
+  end if;
+
+  insert into events (group_id, type, title, total_cents, payer_member_id)
+  values (p_group_id, 'split', p_title, p_total_cents, p_payer_member_id)
+  returning id into v_event_id;
+
+  insert into shares (event_id, group_id, member_id, amount_cents)
+  select v_event_id, p_group_id, (s->>'member_id')::uuid, (s->>'amount_cents')::bigint
+    from jsonb_array_elements(p_shares) as s;
+
+  return v_event_id;
+end;
+$$;
+```
+
+Apply it: `supabase migration up`
+Expected: `0002_create_split` applies with no error.
+
+- [ ] **Step 3b: Write the db client and repo wrapper**
 
 Create `supabase/functions/_shared/db.ts`:
 ```ts
@@ -763,47 +874,34 @@ export async function createSplit(
   db: SupabaseClient,
   input: CreateSplitInput,
 ): Promise<{ eventId: string }> {
+  // fast client-side check (unit-tested); the RPC re-validates as the authoritative backstop
   assertSharesSumTo(
     input.totalCents,
     input.shares.map((s) => ({ memberId: s.memberId, amountCents: s.amountCents })),
   );
 
-  const { data: ev, error: evErr } = await db
-    .from("events")
-    .insert({
-      group_id: input.groupId,
-      type: "split",
-      title: input.title,
-      total_cents: input.totalCents,
-      payer_member_id: input.payerMemberId,
-    })
-    .select()
-    .single();
-  if (evErr) throw new Error(`createSplit event insert: ${evErr.message}`);
-
-  const { error: shErr } = await db.from("shares").insert(
-    input.shares.map((s) => ({
-      event_id: ev!.id,
-      member_id: s.memberId,
-      amount_cents: s.amountCents,
-    })),
-  );
-  if (shErr) throw new Error(`createSplit shares insert: ${shErr.message}`);
-
-  return { eventId: ev!.id as string };
+  const { data, error } = await db.rpc("create_split", {
+    p_group_id: input.groupId,
+    p_title: input.title,
+    p_total_cents: input.totalCents,
+    p_payer_member_id: input.payerMemberId,
+    p_shares: input.shares.map((s) => ({ member_id: s.memberId, amount_cents: s.amountCents })),
+  });
+  if (error) throw new Error(`createSplit: ${error.message}`);
+  return { eventId: data as string };
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/repo_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS (2 tests).
+Expected: PASS (3 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add supabase/functions/_shared/db.ts supabase/functions/_shared/repo.ts tests/repo_test.ts
-git commit -m "feat: createSplit service writes event + shares with validation"
+git add supabase/migrations/0002_create_split.sql supabase/functions/_shared/db.ts supabase/functions/_shared/repo.ts tests/repo_test.ts
+git commit -m "feat: atomic createSplit via create_split RPC (no orphan events)"
 ```
 
 ---
@@ -928,8 +1026,9 @@ git commit -m "feat: getNettedTransfers loads group ledger and nets it"
 - Consumes: `createSplit`, `getNettedTransfers` (Tasks 7–8).
 - Produces:
   - `interface RecordSettlementInput { groupId: string; fromMemberId: string; toMemberId: string; amountCents: number; method: "venmo" | "apple_cash" | "cash" | "other" }`
-  - `async function recordSettlement(db, input): Promise<{ settlementId: string }>` — inserts a `proposed` settlement (or `confirmed` immediately when `method !== "venmo"`, since manual marks are self-confirmed per spec).
-  - `async function confirmSettlement(db, settlementId: string): Promise<void>` — sets status to `confirmed`.
+  - `async function recordSettlement(db, input): Promise<{ settlementId: string }>` — validates the payment is real before inserting: `from→to` must be an **actual outstanding netted debt** and `amount ≤ outstanding` (partial payments allowed; overpay/wrong-direction rejected), and there must be no existing `proposed` settlement for the same pair (double-submit guard). Inserts `proposed` for Venmo (awaits the recipient's confirmation) or `confirmed` immediately for manual marks (`method !== "venmo"`).
+  - `async function confirmSettlement(db, settlementId: string): Promise<void>` — flips a **`proposed`** settlement to `confirmed`; throws if no such proposed row exists (guards double-confirm / bad id).
+  - Note: enforcing that the *creditor specifically* authorizes confirmation requires an authenticated caller — that lands in the auth phase (Plan 2). This task makes the operation safe against bad data; it does not yet authenticate who triggers it.
 
 - [ ] **Step 1: Write the failing test (append to `tests/repo_test.ts`)**
 
@@ -977,6 +1076,76 @@ Deno.test("manual (cash) settlement is confirmed immediately", async () => {
   });
   assertEquals((await getNettedTransfers(db, groupId)).length, 0);
 });
+
+async function seedBowesA2000(db: ReturnType<typeof makeDb>) {
+  const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
+  const [a, b] = members;
+  await createSplit(db, {
+    groupId, title: "x", totalCents: 2000, payerMemberId: a.id,
+    shares: [{ memberId: b.id, amountCents: 2000 }],
+  });
+  return { groupId, a, b }; // B owes A 2000
+}
+
+async function expectThrows(fn: () => Promise<unknown>, needle: string) {
+  let msg = "";
+  try {
+    await fn();
+  } catch (e) {
+    msg = (e as Error).message;
+  }
+  assert(msg.includes(needle), `expected error containing "${needle}", got "${msg}"`);
+}
+
+Deno.test("recordSettlement rejects the wrong direction", async () => {
+  const db = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(db);
+  // A does not owe B — paying A→B must be refused
+  await expectThrows(
+    () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash" }),
+    "no outstanding debt",
+  );
+});
+
+Deno.test("recordSettlement rejects overpayment", async () => {
+  const db = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(db);
+  await expectThrows(
+    () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash" }),
+    "exceeds outstanding",
+  );
+});
+
+Deno.test("recordSettlement allows a partial payment and leaves the remainder", async () => {
+  const db = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(db);
+  await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash" });
+  const transfers = await getNettedTransfers(db, groupId);
+  assertEquals(transfers.length, 1);
+  assertEquals(transfers[0].fromMemberId, b.id);
+  assertEquals(transfers[0].toMemberId, a.id);
+  assertEquals(transfers[0].amountCents, 1500);
+});
+
+Deno.test("recordSettlement rejects a duplicate pending settlement", async () => {
+  const db = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(db);
+  await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" });
+  await expectThrows(
+    () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" }),
+    "pending settlement already exists",
+  );
+});
+
+Deno.test("confirmSettlement throws when there is no proposed row", async () => {
+  const db = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(db);
+  // a cash settlement is already confirmed; confirming it again must fail
+  const { settlementId } = await recordSettlement(db, {
+    groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "cash",
+  });
+  await expectThrows(() => confirmSettlement(db, settlementId), "no proposed settlement");
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1000,6 +1169,34 @@ export async function recordSettlement(
   input: RecordSettlementInput,
 ): Promise<{ settlementId: string }> {
   if (input.amountCents <= 0) throw new Error("settlement amount must be positive");
+
+  // The payment must match a real outstanding netted debt from->to, amount <= outstanding.
+  // (getNettedTransfers reflects only CONFIRMED settlements, so a pending proposed one does
+  // not shrink the outstanding here — the duplicate-guard below stops a double submit.)
+  const outstanding = (await getNettedTransfers(db, input.groupId)).find(
+    (t) => t.fromMemberId === input.fromMemberId && t.toMemberId === input.toMemberId,
+  );
+  if (!outstanding) {
+    throw new Error("no outstanding debt from this member to that member");
+  }
+  if (input.amountCents > outstanding.amountCents) {
+    throw new Error(`amount ${input.amountCents} exceeds outstanding ${outstanding.amountCents}`);
+  }
+
+  // Double-submit guard: at most one pending settlement per from->to pair.
+  const { data: pending, error: pErr } = await db
+    .from("settlements")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("from_member_id", input.fromMemberId)
+    .eq("to_member_id", input.toMemberId)
+    .eq("status", "proposed")
+    .limit(1);
+  if (pErr) throw new Error(`recordSettlement pending check: ${pErr.message}`);
+  if (pending && pending.length > 0) {
+    throw new Error("a pending settlement already exists for this pair");
+  }
+
   // Venmo settlements await the recipient's confirmation; manual marks are self-confirmed.
   const status = input.method === "venmo" ? "proposed" : "confirmed";
   const { data, error } = await db
@@ -1019,18 +1216,24 @@ export async function recordSettlement(
 }
 
 export async function confirmSettlement(db: SupabaseClient, settlementId: string): Promise<void> {
-  const { error } = await db
+  // Only ever flip a currently-proposed row; matching zero rows is an error (bad id / already confirmed).
+  const { data, error } = await db
     .from("settlements")
     .update({ status: "confirmed" })
-    .eq("id", settlementId);
+    .eq("id", settlementId)
+    .eq("status", "proposed")
+    .select("id");
   if (error) throw new Error(`confirmSettlement: ${error.message}`);
+  if (!data || data.length === 0) {
+    throw new Error("no proposed settlement found to confirm");
+  }
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/repo_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS (5 tests).
+Expected: PASS (11 tests — Task 7: 3, Task 8: 1, Task 9: 7).
 
 - [ ] **Step 5: Run the FULL suite and commit**
 
@@ -1046,7 +1249,7 @@ git commit -m "feat: record/confirm settlements; manual marks self-confirm"
 
 ## What this plan delivers
 
-A fully-tested money engine: equal/custom split math with exact-cent rounding, minimal-transfer netting, balance computation honoring voids and confirmed-vs-proposed settlements, and a DB-backed service layer (`createSplit`, `getNettedTransfers`, `recordSettlement`, `confirmSettlement`) — all green against a local Supabase. No HTTP, UI, pools, claim flow, or auth yet.
+A fully-tested money engine: equal/custom split math with exact-cent rounding, minimal-transfer netting, balance computation honoring voids and confirmed-vs-proposed settlements, and a DB-backed service layer (`createSplit`, `getNettedTransfers`, `recordSettlement`, `confirmSettlement`) — all green against a local Supabase. **Ledger integrity is enforced at the DB layer, not just in app code:** composite foreign keys make cross-group references impossible to insert, the `create_split` Postgres function writes event+shares in one transaction (no orphan events), and settlements are validated against the current outstanding debt (no overpay, no wrong-direction, no double-confirm). No HTTP, UI, pools, claim flow, or auth yet.
 
 ## Follow-on plans (not in scope here)
 
