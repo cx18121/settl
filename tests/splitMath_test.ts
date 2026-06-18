@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { equalSplit } from "../supabase/functions/_shared/splitMath.ts";
+import { equalSplit, assertSharesSumTo } from "../supabase/functions/_shared/splitMath.ts";
 
 Deno.test("equalSplit divides evenly when divisible", () => {
   const shares = equalSplit(900, ["a", "b", "c"]);
@@ -23,4 +23,31 @@ Deno.test("equalSplit always sums to total", () => {
 
 Deno.test("equalSplit rejects empty member list", () => {
   assertThrows(() => equalSplit(100, []), Error, "at least one member");
+});
+
+Deno.test("assertSharesSumTo passes when shares match total", () => {
+  assertSharesSumTo(1000, [
+    { memberId: "a", amountCents: 600 },
+    { memberId: "b", amountCents: 400 },
+  ]);
+});
+
+Deno.test("assertSharesSumTo throws when shares miss total", () => {
+  assertThrows(
+    () => assertSharesSumTo(1000, [{ memberId: "a", amountCents: 999 }]),
+    Error,
+    "must sum to total",
+  );
+});
+
+Deno.test("assertSharesSumTo throws on negative share", () => {
+  assertThrows(
+    () =>
+      assertSharesSumTo(1000, [
+        { memberId: "a", amountCents: 1100 },
+        { memberId: "b", amountCents: -100 },
+      ]),
+    Error,
+    "negative",
+  );
 });

@@ -11,3 +11,13 @@ export function equalSplit(totalCents: Cents, memberIds: string[]): ShareInput[]
     return { memberId, amountCents: base + extra };
   });
 }
+
+export function assertSharesSumTo(totalCents: Cents, shares: ShareInput[]): void {
+  for (const s of shares) {
+    if (s.amountCents < 0) throw new Error(`share for ${s.memberId} is negative`);
+  }
+  const sum = shares.reduce((a, s) => a + s.amountCents, 0);
+  if (sum !== totalCents) {
+    throw new Error(`shares must sum to total: got ${sum}, expected ${totalCents}`);
+  }
+}
