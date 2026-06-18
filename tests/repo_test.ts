@@ -1,6 +1,6 @@
 import { assertEquals, assert } from "@std/assert";
 import { makeDb } from "../supabase/functions/_shared/db.ts";
-import { createSplit, getNettedTransfers } from "../supabase/functions/_shared/repo.ts";
+import { createSplit, getNettedTransfers, recordSettlement, confirmSettlement } from "../supabase/functions/_shared/repo.ts";
 
 async function seedGroupWithMembers(db: ReturnType<typeof makeDb>, names: string[]) {
   const { data: g } = await db.from("groups").insert({ title: "test" }).select().single();
@@ -129,5 +129,152 @@ Deno.test({
       assertEquals(t.toMemberId, a.id);
       assertEquals(t.amountCents, 1500);
     }
+  },
+});
+
+Deno.test({
+  name: "confirmed settlement clears the netted debt",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
+    const [a, b] = members;
+    await createSplit(db, {
+      groupId,
+      title: "Loan",
+      totalCents: 2000,
+      payerMemberId: a.id,
+      shares: [{ memberId: b.id, amountCents: 2000 }],
+    });
+    // before: B owes A 2000
+    assertEquals((await getNettedTransfers(db, groupId)).length, 1);
+
+    const { settlementId } = await recordSettlement(db, {
+      groupId,
+      fromMemberId: b.id,
+      toMemberId: a.id,
+      amountCents: 2000,
+      method: "venmo",
+    });
+    // venmo settlement starts 'proposed' → still owed until confirmed
+    assertEquals((await getNettedTransfers(db, groupId)).length, 1);
+
+    await confirmSettlement(db, settlementId);
+    assertEquals((await getNettedTransfers(db, groupId)).length, 0);
+  },
+});
+
+Deno.test({
+  name: "manual (cash) settlement is confirmed immediately",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
+    const [a, b] = members;
+    await createSplit(db, {
+      groupId, title: "x", totalCents: 1000, payerMemberId: a.id,
+      shares: [{ memberId: b.id, amountCents: 1000 }],
+    });
+    await recordSettlement(db, {
+      groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 1000, method: "cash",
+    });
+    assertEquals((await getNettedTransfers(db, groupId)).length, 0);
+  },
+});
+
+async function seedBowesA2000(db: ReturnType<typeof makeDb>) {
+  const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
+  const [a, b] = members;
+  await createSplit(db, {
+    groupId, title: "x", totalCents: 2000, payerMemberId: a.id,
+    shares: [{ memberId: b.id, amountCents: 2000 }],
+  });
+  return { groupId, a, b }; // B owes A 2000
+}
+
+async function expectThrows(fn: () => Promise<unknown>, needle: string) {
+  let msg = "";
+  try {
+    await fn();
+  } catch (e) {
+    msg = (e as Error).message;
+  }
+  assert(msg.includes(needle), `expected error containing "${needle}", got "${msg}"`);
+}
+
+Deno.test({
+  name: "recordSettlement rejects the wrong direction",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, a, b } = await seedBowesA2000(db);
+    // A does not owe B — paying A→B must be refused
+    await expectThrows(
+      () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash" }),
+      "no outstanding debt",
+    );
+  },
+});
+
+Deno.test({
+  name: "recordSettlement rejects overpayment",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, a, b } = await seedBowesA2000(db);
+    await expectThrows(
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash" }),
+      "exceeds outstanding",
+    );
+  },
+});
+
+Deno.test({
+  name: "recordSettlement allows a partial payment and leaves the remainder",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, a, b } = await seedBowesA2000(db);
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash" });
+    const transfers = await getNettedTransfers(db, groupId);
+    assertEquals(transfers.length, 1);
+    assertEquals(transfers[0].fromMemberId, b.id);
+    assertEquals(transfers[0].toMemberId, a.id);
+    assertEquals(transfers[0].amountCents, 1500);
+  },
+});
+
+Deno.test({
+  name: "recordSettlement rejects a duplicate pending settlement",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, a, b } = await seedBowesA2000(db);
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" });
+    await expectThrows(
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" }),
+      "pending settlement already exists",
+    );
+  },
+});
+
+Deno.test({
+  name: "confirmSettlement throws when there is no proposed row",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const db = makeDb();
+    const { groupId, a, b } = await seedBowesA2000(db);
+    // a cash settlement is already confirmed; confirming it again must fail
+    const { settlementId } = await recordSettlement(db, {
+      groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "cash",
+    });
+    await expectThrows(() => confirmSettlement(db, settlementId), "no proposed settlement");
   },
 });

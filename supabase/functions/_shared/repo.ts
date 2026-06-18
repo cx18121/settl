@@ -74,3 +74,78 @@ export async function getNettedTransfers(
 
   return minimalTransfers(netPositions(eventRows, shareRows, settlementRows));
 }
+
+export interface RecordSettlementInput {
+  groupId: string;
+  fromMemberId: string;
+  toMemberId: string;
+  amountCents: number;
+  method: "venmo" | "apple_cash" | "cash" | "other";
+}
+
+export async function recordSettlement(
+  db: SupabaseClient,
+  input: RecordSettlementInput,
+): Promise<{ settlementId: string }> {
+  if (input.amountCents <= 0) throw new Error("settlement amount must be positive");
+
+  // The payment must match a real outstanding netted debt from->to, amount <= outstanding.
+  // (getNettedTransfers reflects only CONFIRMED settlements, so a pending proposed one does
+  // not shrink the outstanding here — the duplicate-guard below stops a double submit.)
+  const outstanding = (await getNettedTransfers(db, input.groupId)).find(
+    (t) => t.fromMemberId === input.fromMemberId && t.toMemberId === input.toMemberId,
+  );
+  if (!outstanding) {
+    throw new Error("no outstanding debt from this member to that member");
+  }
+  if (input.amountCents > outstanding.amountCents) {
+    throw new Error(`amount ${input.amountCents} exceeds outstanding ${outstanding.amountCents}`);
+  }
+
+  // Double-submit guard: at most one pending settlement per from->to pair.
+  // This gives a friendly error; the `one_pending_settlement_per_pair` unique
+  // index is the real backstop that also holds under concurrent submissions.
+  const { data: pending, error: pErr } = await db
+    .from("settlements")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("from_member_id", input.fromMemberId)
+    .eq("to_member_id", input.toMemberId)
+    .eq("status", "proposed")
+    .limit(1);
+  if (pErr) throw new Error(`recordSettlement pending check: ${pErr.message}`);
+  if (pending && pending.length > 0) {
+    throw new Error("a pending settlement already exists for this pair");
+  }
+
+  // Venmo settlements await the recipient's confirmation; manual marks are self-confirmed.
+  const status = input.method === "venmo" ? "proposed" : "confirmed";
+  const { data, error } = await db
+    .from("settlements")
+    .insert({
+      group_id: input.groupId,
+      from_member_id: input.fromMemberId,
+      to_member_id: input.toMemberId,
+      amount_cents: input.amountCents,
+      method: input.method,
+      status,
+    })
+    .select()
+    .single();
+  if (error) throw new Error(`recordSettlement: ${error.message}`);
+  return { settlementId: data!.id as string };
+}
+
+export async function confirmSettlement(db: SupabaseClient, settlementId: string): Promise<void> {
+  // Only ever flip a currently-proposed row; matching zero rows is an error (bad id / already confirmed).
+  const { data, error } = await db
+    .from("settlements")
+    .update({ status: "confirmed" })
+    .eq("id", settlementId)
+    .eq("status", "proposed")
+    .select("id");
+  if (error) throw new Error(`confirmSettlement: ${error.message}`);
+  if (!data || data.length === 0) {
+    throw new Error("no proposed settlement found to confirm");
+  }
+}
