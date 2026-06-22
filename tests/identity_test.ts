@@ -47,3 +47,14 @@ Deno.test("authorizeGroup passes with the right token, throws otherwise", {
   try { await authorizeGroup(d, groupId, null); } catch (e) { threw2 = (e as Error).message; }
   assert(threw2.includes("unauthorized"), `expected unauthorized for null token, got: ${threw2}`);
 });
+
+Deno.test("addMembers rejects an empty names list", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = db();
+  const { groupId } = await createGroup(d, { title: "t" });
+  let threw = "";
+  try { await addMembers(d, { groupId, names: [] }); } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("at least one name"), `expected empty-names error, got: ${threw}`);
+});
