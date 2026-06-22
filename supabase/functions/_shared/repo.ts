@@ -22,11 +22,13 @@ export async function createSplit(
     input.shares.map((s) => ({ memberId: s.memberId, amountCents: s.amountCents })),
   );
 
-  const { data, error } = await db.rpc("create_split", {
+  const { data, error } = await db.rpc("create_event", {
     p_group_id: input.groupId,
+    p_type: "split",
     p_title: input.title,
     p_total_cents: input.totalCents,
     p_payer_member_id: input.payerMemberId,
+    p_target_cents: null,
     p_shares: input.shares.map((s) => ({ member_id: s.memberId, amount_cents: s.amountCents })),
   });
   if (error) throw new Error(`createSplit: ${error.message}`);
