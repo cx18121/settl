@@ -16,7 +16,7 @@
 - **Only `confirmed` settlements affect balances**; `proposed` do not.
 - **Net positions of a group always sum to zero.**
 - **The schema is a trust boundary**: cross-group references are impossible (composite FKs from Plan 1). Postgres functions set `search_path = ''` and schema-qualify tables (`public.*`).
-- **Identity = no accounts.** Authorization rests on a per-group **invite token** (random secret in the share link) + a per-device **device-id**. Being in the group (correct `(group_id, invite_token)`) authorizes read, event creation, settlement recording, and voiding. **Claiming a seat binds a device-id first-come**; a different device claiming an already-claimed seat is rejected; same-device re-claim is idempotent.
+- **Identity = no accounts.** Authorization rests on a per-group **invite token** (random secret in the share link) + a per-device **device-id**. Being in the group (correct `(group_id, invite_token)`) authorizes read, event creation, and settlement recording. **Destructive ops require a device bound to a claimed member**: voiding an event (audited via `voided_by`) and confirming a Venmo settlement (must be the creditor's device). **Claiming a seat binds a device-id first-come**; a different device claiming an already-claimed seat is rejected; same-device re-claim is idempotent.
 - **Confirming a Venmo settlement requires the caller's device to be the one bound to the creditor (`to_member`)** — the only device-gated op.
 - **Settlement concurrency**: `record_settlement` runs under a per-group advisory lock + a **required** client `idempotency_key` (unique per group) so retries/concurrent submits can't double-count; a missing/blank key is rejected, and reusing a key for *different* payment details is a 409 conflict (not a silent return). At most one `proposed` settlement per debtor→creditor pair (partial unique index from Plan 1). `amount ≤ outstanding` is a fat-finger UX guard, not a ledger invariant (overpay is economically valid).
 - **HTTP**: one edge function `supabase/functions/api/`; its handler is `handle(req: Request, db: SupabaseClient): Promise<Response>`, JSON in/out. Auth headers: `x-settl-token` (group invite token), `x-settl-device` (device id).
@@ -24,7 +24,7 @@
 
 ## Design notes (read before implementing)
 
-- **Authorization matrix.** `createGroup`: no auth. `addMembers`, `claimMember`, `getNettedTransfers`, `createSplit/Pool/Loan/Order`, `recordSettlement`, `voidEvent`: require valid `(groupId, token)`. `confirmSettlement`: requires valid token **and** caller device == creditor's bound device.
+- **Authorization matrix.** `createGroup`: no auth. `addMembers`, `claimMember`, `getNettedTransfers`, `createSplit/Pool/Loan/Order`, `recordSettlement`: require valid `(groupId, token)`. `voidEvent`: requires valid token **and** caller device == a claimed member of the group (audited). `confirmSettlement`: requires valid token **and** caller device == the creditor's bound device.
 - **Pool semantics.** A pool is a collection toward a target: the organizer is the event `payer`, each contributor owes their equal share of `target_cents` toward the organizer. Mechanically identical to a split the organizer "fronted." A visual progress bar is a Plan 4 (extension) concern and is intentionally **not** built here.
 - **Order semantics.** A group-order is a custom split by item; each item is one member's share. It differs from a custom split only by the `type` tag (which later drives different extension UI).
 - **`shares.paid` is unused** (balances come from netting, not per-share flags); leave it as-is, do not wire it.
@@ -36,7 +36,8 @@
 - `supabase/migrations/0004_invite_token.sql` — add `groups.invite_token`.
 - `supabase/migrations/0005_claim_member.sql` — `claim_member` RPC (atomic first-come).
 - `supabase/migrations/0006_create_event.sql` — `create_event` RPC; drop `create_split`.
-- `supabase/migrations/0007_record_settlement.sql` — `settlements.idempotency_key` + `record_settlement` RPC.
+- `supabase/migrations/0007_void_audit.sql` — `events.voided_by_member_id` + `events.voided_at` audit columns.
+- `supabase/migrations/0008_record_settlement.sql` — `settlements.idempotency_key` + `record_settlement` RPC.
 - `supabase/functions/_shared/auth.ts` — `authorizeGroup`.
 - `supabase/functions/_shared/repo.ts` — extend: `createGroup`, `addMembers`, `claimMember`, `createPool`, `createLoan`, `createOrder`, `voidEvent`; refactor `createSplit`, `recordSettlement`, `confirmSettlement`.
 - `supabase/functions/api/router.ts` — `handle(req, db)` request router.
@@ -772,38 +773,61 @@ git commit -m "feat: createOrder (custom by-item split)"
 
 ---
 
-### Task 8: `voidEvent`
+### Task 8: `voidEvent` (device-gated + audited)
 
 **Files:**
+- Create: `supabase/migrations/0007_void_audit.sql`
 - Modify: `supabase/functions/_shared/repo.ts` (append)
 - Test: `tests/flows_test.ts` (append)
 
 **Interfaces:**
-- Consumes: `createSplit`, `getNettedTransfers`.
-- Produces: `async function voidEvent(db, input: { groupId: string; eventId: string }): Promise<void>` — sets `voided = true` on an active event in the group; throws `"no active event found to void"` if none matched (wrong group, missing, or already voided).
+- Consumes: `createSplit`, `claimMember`, `getNettedTransfers`.
+- Produces: `async function voidEvent(db, input: { groupId: string; eventId: string; deviceId: string }): Promise<void>` — voiding is a **destructive** edit, so it requires the caller's `deviceId` to resolve to a **claimed member of the group** (accountability); records `voided_by_member_id` + `voided_at` for an audit trail; then sets `voided = true`. Throws `"unauthorized: void requires a claimed member of this group"` if the device isn't a claimed member, and `"no active event found to void"` if no active event matched (wrong group, missing, or already voided).
 
-- [ ] **Step 1: Write the failing test (append to `tests/flows_test.ts`)**
+**Why device-gated (not creator-only):** the spec's trust model is "anyone in the group, everything disputable." Restricting voids to the event creator would block legitimate group cleanup and contradict that model. Requiring a *claimed* member (a real participant, not any link-holder) plus an audit record (`voided_by`) is the proportionate hardening: destructive changes are attributable and recoverable, while staying group-disputable. Event *creation* stays token-only because it's additive and self-evidently disputable by the member it names; voiding is gated more strictly because it silently removes a claim.
 
+- [ ] **Step 1: Write the migration + the failing test**
+
+Create `supabase/migrations/0007_void_audit.sql`:
+```sql
+alter table events
+  add column voided_by_member_id uuid,
+  add column voided_at timestamptz;
+
+-- the actor must be a member of the SAME group (composite FK, trust boundary)
+alter table events
+  add constraint events_voided_by_fk
+  foreign key (voided_by_member_id, group_id) references members (id, group_id);
+```
+
+Apply: `supabase migration up` (or `supabase db reset`).
+
+Append to `tests/flows_test.ts`:
 ```ts
-import { createSplit, voidEvent } from "../supabase/functions/_shared/repo.ts";
+import { claimMember, createSplit, voidEvent } from "../supabase/functions/_shared/repo.ts";
 
-Deno.test("voidEvent reverses the event's balances", {
+Deno.test("voidEvent by a claimed member reverses balances and records the actor", {
   sanitizeResources: false,
   sanitizeOps: false,
 }, async () => {
   const d = makeDb();
   const { groupId, memberIds } = await seed(d, ["A", "B"]);
   const [a, b] = memberIds;
+  await claimMember(d, { groupId, memberId: a, deviceId: "dev-A" });
   const { eventId } = await createSplit(d, {
     groupId, title: "x", totalCents: 1000, payerMemberId: a,
     shares: [{ memberId: b, amountCents: 1000 }],
   });
   assertEquals((await getNettedTransfers(d, groupId)).length, 1);
-  await voidEvent(d, { groupId, eventId });
+  await voidEvent(d, { groupId, eventId, deviceId: "dev-A" });
   assertEquals((await getNettedTransfers(d, groupId)).length, 0);
+  const { data: ev } = await d.from("events").select("voided, voided_by_member_id, voided_at").eq("id", eventId).single();
+  assertEquals(ev!.voided, true);
+  assertEquals(ev!.voided_by_member_id, a);
+  assert(ev!.voided_at, "voided_at recorded");
 });
 
-Deno.test("voidEvent throws when the event is already voided or missing", {
+Deno.test("voidEvent rejects a caller with no claimed seat in the group", {
   sanitizeResources: false,
   sanitizeOps: false,
 }, async () => {
@@ -814,9 +838,27 @@ Deno.test("voidEvent throws when the event is already voided or missing", {
     groupId, title: "x", totalCents: 500, payerMemberId: a,
     shares: [{ memberId: b, amountCents: 500 }],
   });
-  await voidEvent(d, { groupId, eventId });
   let threw = "";
-  try { await voidEvent(d, { groupId, eventId }); } catch (e) { threw = (e as Error).message; }
+  try { await voidEvent(d, { groupId, eventId, deviceId: "dev-nobody" }); } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("claimed member"), `expected claimed-member error, got: ${threw}`);
+  assertEquals((await getNettedTransfers(d, groupId)).length, 1, "debt untouched after rejected void");
+});
+
+Deno.test("voidEvent throws when the event is already voided or missing", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, memberIds } = await seed(d, ["A", "B"]);
+  const [a, b] = memberIds;
+  await claimMember(d, { groupId, memberId: a, deviceId: "dev-A" });
+  const { eventId } = await createSplit(d, {
+    groupId, title: "x", totalCents: 500, payerMemberId: a,
+    shares: [{ memberId: b, amountCents: 500 }],
+  });
+  await voidEvent(d, { groupId, eventId, deviceId: "dev-A" });
+  let threw = "";
+  try { await voidEvent(d, { groupId, eventId, deviceId: "dev-A" }); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes("no active event"), `expected no-active-event, got: ${threw}`);
 });
 ```
@@ -831,11 +873,22 @@ Expected: FAIL — `voidEvent` not exported.
 ```ts
 export async function voidEvent(
   db: SupabaseClient,
-  input: { groupId: string; eventId: string },
+  input: { groupId: string; eventId: string; deviceId: string },
 ): Promise<void> {
+  // Destructive op: the caller must be a CLAIMED member of this group.
+  const { data: actor, error: aErr } = await db
+    .from("members")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("device_id", input.deviceId)
+    .eq("claimed", true)
+    .maybeSingle();
+  if (aErr) throw new Error(`voidEvent: ${aErr.message}`);
+  if (!actor) throw new Error("unauthorized: void requires a claimed member of this group");
+
   const { data, error } = await db
     .from("events")
-    .update({ voided: true })
+    .update({ voided: true, voided_by_member_id: actor.id, voided_at: new Date().toISOString() })
     .eq("id", input.eventId)
     .eq("group_id", input.groupId)
     .eq("voided", false)
@@ -848,13 +901,13 @@ export async function voidEvent(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/flows_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS (5 tests).
+Expected: PASS (6 tests — 3 creation flows from Tasks 5–7 plus the 3 void tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add supabase/functions/_shared/repo.ts tests/flows_test.ts
-git commit -m "feat: voidEvent (immutable-edit reversal)"
+git add supabase/migrations/0007_void_audit.sql supabase/functions/_shared/repo.ts tests/flows_test.ts
+git commit -m "feat: voidEvent device-gated + audited (voided_by/voided_at)"
 ```
 
 ---
@@ -862,7 +915,7 @@ git commit -m "feat: voidEvent (immutable-edit reversal)"
 ### Task 9: settlement concurrency hardening (`record_settlement` RPC + idempotency)
 
 **Files:**
-- Create: `supabase/migrations/0007_record_settlement.sql`
+- Create: `supabase/migrations/0008_record_settlement.sql`
 - Modify: `supabase/functions/_shared/repo.ts` (`RecordSettlementInput` + `recordSettlement` body)
 - Test: `tests/settlement2_test.ts`
 
@@ -968,7 +1021,7 @@ Expected: FAIL — `idempotencyKey` not honored / `record_settlement` RPC missin
 
 - [ ] **Step 3: Write the migration + refactor `recordSettlement`**
 
-Create `supabase/migrations/0007_record_settlement.sql`:
+Create `supabase/migrations/0008_record_settlement.sql`:
 ```sql
 alter table settlements add column idempotency_key text;
 
@@ -1072,7 +1125,7 @@ Expected: PASS — the 4 new idempotency tests (dedup, different-key, blank-key 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add supabase/migrations/0007_record_settlement.sql supabase/functions/_shared/repo.ts tests/settlement2_test.ts
+git add supabase/migrations/0008_record_settlement.sql supabase/functions/_shared/repo.ts tests/settlement2_test.ts
 git commit -m "feat: record_settlement RPC (per-group advisory lock + idempotency key)"
 ```
 
@@ -1612,7 +1665,7 @@ Deno.test("POST /settlements without an idempotency key is rejected (400)", {
   assertEquals(res.status, 400);
 });
 
-Deno.test("void over HTTP reverses an event", {
+Deno.test("void over HTTP requires a claimed member — token alone cannot void", {
   sanitizeResources: false,
   sanitizeOps: false,
 }, async () => {
@@ -1620,8 +1673,15 @@ Deno.test("void over HTTP reverses an event", {
   const [a, b] = memberIds;
   const { eventId } = await (await handle(req("POST", `/groups/${groupId}/splits`,
     { totalCents: 800, payerMemberId: a, shares: [{ memberId: b, amountCents: 800 }] }, tok), db)).json();
-  const v = await handle(req("POST", `/groups/${groupId}/events/${eventId}/void`, {}, tok), db);
-  assertEquals(v.status, 200);
+  // an unclaimed device holding only the invite token must NOT be able to void
+  const denied = await handle(req("POST", `/groups/${groupId}/events/${eventId}/void`, {}, { ...tok, "x-settl-device": "dev-stranger" }), db);
+  assertEquals(denied.status, 403);
+  const stillOwed = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
+  assertEquals(stillOwed.transfers.length, 1, "debt untouched by rejected void");
+  // after claiming a seat, the member can void
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: a }, { ...tok, "x-settl-device": "dev-A" }), db);
+  const ok = await handle(req("POST", `/groups/${groupId}/events/${eventId}/void`, {}, { ...tok, "x-settl-device": "dev-A" }), db);
+  assertEquals(ok.status, 200);
   const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
   assertEquals(bal.transfers.length, 0);
 });
@@ -1678,7 +1738,8 @@ Then, after the `parts.length >= 3` group block, add handling for the 4-segment 
         return json({ ok: true }, 200);
       }
       if (parts[2] === "events" && parts[4] === "void") {
-        await voidEvent(db, { groupId, eventId: parts[3] });
+        if (!device) throw new Error("missing device id");
+        await voidEvent(db, { groupId, eventId: parts[3], deviceId: device });
         return json({ ok: true }, 200);
       }
     }
