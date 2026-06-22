@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { assertSharesSumTo } from "./splitMath.ts";
+import { assertSharesSumTo, equalSplit } from "./splitMath.ts";
 import { netPositions, type EventRow, type ShareRow, type SettlementRow } from "./balances.ts";
 import { minimalTransfers } from "./netting.ts";
 import type { Transfer } from "./types.ts";
@@ -199,4 +199,30 @@ export async function claimMember(db: SupabaseClient, input: ClaimMemberInput): 
   });
   if (error) throw new Error(`claimMember: ${error.message}`);
   if (data !== true) throw new Error("member already claimed by another device");
+}
+
+export interface CreatePoolInput {
+  groupId: string;
+  title: string | null;
+  targetCents: number;
+  organizerMemberId: string;
+  contributorMemberIds: string[];
+}
+
+export async function createPool(
+  db: SupabaseClient,
+  input: CreatePoolInput,
+): Promise<{ eventId: string }> {
+  const shares = equalSplit(input.targetCents, input.contributorMemberIds);
+  const { data, error } = await db.rpc("create_event", {
+    p_group_id: input.groupId,
+    p_type: "pool",
+    p_title: input.title,
+    p_total_cents: input.targetCents,
+    p_payer_member_id: input.organizerMemberId,
+    p_target_cents: input.targetCents,
+    p_shares: shares.map((s) => ({ member_id: s.memberId, amount_cents: s.amountCents })),
+  });
+  if (error) throw new Error(`createPool: ${error.message}`);
+  return { eventId: data as string };
 }
