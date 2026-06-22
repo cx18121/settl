@@ -78,14 +78,20 @@ So there are **two creation flows** — **Split** (equal/custom, with a group-or
 
 Five tables. Net balances are **computed**, never stored.
 
-- **groups** — one per iMessage conversation. `(id, title, created_at)`
+- **groups** — one per iMessage conversation. `(id, title, invite_token, created_at)`. `invite_token` is a random secret minted at creation that lives in the share/deep link (see Identity & authorization).
 - **members** — a named person in a group. `(id, group_id, display_name, venmo_handle, device_id nullable, claimed bool)`
   - *Claim flow:* the extension only sees opaque, per-device participant UUIDs (Apple anonymizes participants — no names, no numbers). So the creator types names; when another person opens the bubble they tap "I'm Jake" to bind their `device_id`. This sidesteps Apple's anonymization.
 - **events** — a split/pool/loan/order. `(id, group_id, type, title, total_cents, payer_member_id, target_cents nullable, created_at, voided bool)`
 - **shares** — what each member owes toward an event. `(id, event_id, member_id, amount_cents, paid bool)`
-- **settlements** — a payment between two members. `(id, group_id, from_member_id, to_member_id, amount_cents, method, status, created_at)` where `method ∈ {venmo, apple_cash, cash, other}` and `status ∈ {proposed, confirmed}`.
+- **settlements** — a payment between two members. `(id, group_id, from_member_id, to_member_id, amount_cents, method, status, idempotency_key nullable, created_at)` where `method ∈ {venmo, apple_cash, cash, other}` and `status ∈ {proposed, confirmed}`. `idempotency_key` is a client-supplied key (unique per group) so a retried request can't double-count the same payment.
 
 **Net balance** of a member = (shares they owe) − (shares others owe them, where they were payer) − (settlements they've made) + (settlements made to them). The netting function reduces all net positions to the **minimum set of transfers** (greedy: largest debtor ↔ largest creditor).
+
+**Identity & authorization (no accounts).** Per the locked decision, there are no user accounts. Authorization rests on two things: a per-group **invite token** (a random secret minted at group creation, carried in the share/deep link) and a per-device **device-id** (generated on first use). The model is deliberately light because the trust model is *social* — money never moves without someone tapping Venmo, and every ledger entry is group-visible and disputable, so the worst case is a wrong number, not theft.
+- **Being in the group = being invited.** Any caller presenting the correct `(group_id, invite_token)` may read the group, create events (split/pool/loan/order), record settlements, and void events. This mirrors "anyone in the group can log who owes who."
+- **Claiming a seat** binds a `device_id` to a `members` row **first-come**: the first device to claim an unclaimed seat owns it; a different device trying to claim an already-claimed seat is rejected. Re-claiming from the same device is idempotent (e.g. to update a Venmo handle).
+- **Device binding gates the one sensitive op:** confirming a Venmo settlement's receipt requires the caller's device to be the one bound to the **creditor** (`to_member`) — the "creditor authorizes" rule deferred from the ledger-core phase. Everything else only needs the group token.
+- **Concurrency:** settlement recording runs under a per-group advisory lock plus a client idempotency key, so concurrent or retried submissions can't double-count a payment; at most one `proposed` settlement per debtor→creditor pair is enforced by a partial unique index.
 
 ---
 
