@@ -18,7 +18,7 @@
 - **The schema is a trust boundary**: cross-group references are impossible (composite FKs from Plan 1). Postgres functions set `search_path = ''` and schema-qualify tables (`public.*`).
 - **Identity = no accounts.** Authorization rests on a per-group **invite token** (random secret in the share link) + a per-device **device-id**. Being in the group (correct `(group_id, invite_token)`) authorizes read, event creation, settlement recording, and voiding. **Claiming a seat binds a device-id first-come**; a different device claiming an already-claimed seat is rejected; same-device re-claim is idempotent.
 - **Confirming a Venmo settlement requires the caller's device to be the one bound to the creditor (`to_member`)** — the only device-gated op.
-- **Settlement concurrency**: `record_settlement` runs under a per-group advisory lock + a client `idempotency_key` (unique per group) so retries/concurrent submits can't double-count; at most one `proposed` settlement per debtor→creditor pair (partial unique index from Plan 1). `amount ≤ outstanding` is a fat-finger UX guard, not a ledger invariant (overpay is economically valid).
+- **Settlement concurrency**: `record_settlement` runs under a per-group advisory lock + a **required** client `idempotency_key` (unique per group) so retries/concurrent submits can't double-count; a missing/blank key is rejected, and reusing a key for *different* payment details is a 409 conflict (not a silent return). At most one `proposed` settlement per debtor→creditor pair (partial unique index from Plan 1). `amount ≤ outstanding` is a fat-finger UX guard, not a ledger invariant (overpay is economically valid).
 - **HTTP**: one edge function `supabase/functions/api/`; its handler is `handle(req: Request, db: SupabaseClient): Promise<Response>`, JSON in/out. Auth headers: `x-settl-token` (group invite token), `x-settl-device` (device id).
 - Deno asserts from `jsr:@std/assert@1`. Integration tests run against a local Supabase started via the CLI; service-role key passed as `SUPABASE_SERVICE_ROLE_KEY`. supabase-js's realtime heartbeat trips Deno's resource sanitizer, so integration tests use `Deno.test(name, { sanitizeResources: false, sanitizeOps: false }, fn)` (precedent: `tests/schema_test.ts`, `tests/repo_test.ts`).
 
@@ -869,7 +869,7 @@ git commit -m "feat: voidEvent (immutable-edit reversal)"
 **Interfaces:**
 - Consumes: `getNettedTransfers`, `createSplit`, `createGroup`, `addMembers`.
 - Produces:
-  - `RecordSettlementInput` gains `idempotencyKey?: string`.
+  - `RecordSettlementInput` gains a **required** `idempotencyKey: string` (non-blank). Idempotency is mandatory: it's the only thing that makes "a retried submit can't double-count" true, so a missing/blank key is rejected rather than silently inserting.
   - `recordSettlement` keeps its TS validation (outstanding/direction/overpay/dup-pending UX guards) but inserts via the `record_settlement(p_group_id, p_from, p_to, p_amount, p_method, p_status, p_idempotency_key)` RPC, which serializes per-group via `pg_advisory_xact_lock` and returns the existing row's id when the idempotency key was already used.
 
 - [ ] **Step 1: Write the failing test**
@@ -930,12 +930,41 @@ Deno.test("recordSettlement still allows a genuine second payment (different key
   const transfers = await getNettedTransfers(d, groupId);
   assertEquals(transfers[0].amountCents, 500); // 2000 - 800 - 700
 });
+
+Deno.test("recordSettlement rejects a blank idempotency key", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(d);
+  let threw = "";
+  try {
+    await recordSettlement(d, { groupId, fromMemberId: b, toMemberId: a, amountCents: 1000, method: "cash", idempotencyKey: "" });
+  } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("idempotencyKey is required"), `expected required-key error, got: ${threw}`);
+  assertEquals((await d.from("settlements").select("id").eq("group_id", groupId)).data!.length, 0, "nothing inserted");
+});
+
+Deno.test("recordSettlement rejects an idempotency key reused for a different payment", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, a, b } = await seedBowesA2000(d);
+  await recordSettlement(d, { groupId, fromMemberId: b, toMemberId: a, amountCents: 800, method: "cash", idempotencyKey: "dup" });
+  let threw = "";
+  try {
+    // same key, different amount → must NOT silently return the old settlement
+    await recordSettlement(d, { groupId, fromMemberId: b, toMemberId: a, amountCents: 700, method: "cash", idempotencyKey: "dup" });
+  } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("different payment details"), `expected idempotency conflict, got: ${threw}`);
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settlement2_test.ts --allow-env --allow-net --allow-read`
-Expected: FAIL — `idempotencyKey` not honored / `record_settlement` RPC missing (the dup test sees 2 rows).
+Expected: FAIL — `idempotencyKey` not honored / `record_settlement` RPC missing (the dup test sees 2 rows; the required-key and reuse-conflict tests have no guard yet).
 
 - [ ] **Step 3: Write the migration + refactor `recordSettlement`**
 
@@ -962,15 +991,27 @@ set search_path = ''
 as $$
 declare
   v_id uuid;
+  v_existing public.settlements%rowtype;
 begin
   perform pg_advisory_xact_lock(hashtext(p_group_id::text));
 
   if p_idempotency_key is not null then
-    select id into v_id
+    select * into v_existing
       from public.settlements
      where group_id = p_group_id and idempotency_key = p_idempotency_key;
     if found then
-      return v_id;
+      -- exact replay → return the same id; otherwise the key was reused for a
+      -- different payment, which is a client bug we must surface, not mask.
+      if v_existing.from_member_id = p_from
+         and v_existing.to_member_id = p_to
+         and v_existing.amount_cents = p_amount
+         and v_existing.method = p_method
+         and v_existing.status = p_status then
+        return v_existing.id;
+      else
+        raise exception 'idempotency key reused with different payment details'
+          using errcode = 'check_violation';
+      end if;
     end if;
   end if;
 
@@ -987,7 +1028,7 @@ $$;
 
 Apply: `supabase migration up` (or `supabase db reset`).
 
-In `supabase/functions/_shared/repo.ts`, change the `RecordSettlementInput` interface to add the optional key:
+In `supabase/functions/_shared/repo.ts`, change the `RecordSettlementInput` interface to add the **required** key:
 ```ts
 export interface RecordSettlementInput {
   groupId: string;
@@ -995,10 +1036,15 @@ export interface RecordSettlementInput {
   toMemberId: string;
   amountCents: number;
   method: "venmo" | "apple_cash" | "cash" | "other";
-  idempotencyKey?: string;
+  idempotencyKey: string;
 }
 ```
-Then, inside `recordSettlement`, keep the existing validation (positive amount, outstanding lookup, overpay check, pending-dup check) and replace the final `db.from("settlements").insert(...)` block with the RPC call:
+Then, inside `recordSettlement`, add a guard at the very top (before the positive-amount check) and keep the rest of the existing validation (positive amount, outstanding lookup, overpay check, pending-dup check), and replace the final `db.from("settlements").insert(...)` block with the RPC call:
+```ts
+  if (!input.idempotencyKey || input.idempotencyKey.trim() === "") {
+    throw new Error("idempotencyKey is required");
+  }
+```
 ```ts
   const status = input.method === "venmo" ? "proposed" : "confirmed";
   const { data, error } = await db.rpc("record_settlement", {
@@ -1008,18 +1054,20 @@ Then, inside `recordSettlement`, keep the existing validation (positive amount, 
     p_amount: input.amountCents,
     p_method: input.method,
     p_status: status,
-    p_idempotency_key: input.idempotencyKey ?? null,
+    p_idempotency_key: input.idempotencyKey,
   });
   if (error) throw new Error(`recordSettlement: ${error.message}`);
   return { settlementId: data as string };
 ```
+
+**Update every existing `recordSettlement` call to pass a key.** Because the field is now required, the Plan-1 settlement tests in `tests/repo_test.ts` (confirmed-clears-debt, manual-cash, wrong-direction, overpay, partial, duplicate-pending, confirm-no-proposed-row) must each add `idempotencyKey: "k1"`. **Exception — the duplicate-pending test makes two `recordSettlement` calls for the same pair: give the first `idempotencyKey: "k1"` and the second `idempotencyKey: "k2"`**, otherwise the second call would be deduped by idempotency and return the first id instead of hitting the "pending settlement already exists" guard. Likewise, the two `recordSettlement` calls in the Task-10 confirm tests in `tests/settlement2_test.ts` (creditor-device test and cross-group test) each need an `idempotencyKey` (e.g. `"k1"`).
 
 **Concurrency safety model (read this — the TS validation runs *before* the lock by design):** the only outcome that corrupts the ledger is counting the *same* payment twice, and that is closed *inside* the advisory lock by the idempotency-key dedup. Duplicate *pending* proposals are closed by the `settlements_idempotency_key`-sibling partial unique index (a hard DB constraint — the second concurrent insert fails even if the TS check raced). The remaining racy check, `amount ≤ outstanding`, is a **best-effort fat-finger guard, not a ledger invariant**: two genuine concurrent payments (different idempotency keys) can both pass it and produce an overpay, which is **economically valid** (the recipient simply now owes the difference; net positions still sum to zero, and it's group-visible and disputable). We deliberately do **not** reimplement the netting engine in SQL to make this guard airtight — that would duplicate the tested TS engine to defend a guard whose failure mode is acceptable. Do not "fix" this by moving netting into the RPC.
 
 - [ ] **Step 4: Run the new test AND the existing settlement tests to verify all pass**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settlement2_test.ts tests/repo_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS — the 2 new idempotency tests plus the existing `recordSettlement` validation tests (wrong-direction, overpay, partial, duplicate-pending) all green.
+Expected: PASS — the 4 new idempotency tests (dedup, different-key, blank-key rejected, reuse-conflict) plus the existing `recordSettlement` validation tests in `repo_test.ts` (wrong-direction, overpay, partial, duplicate-pending), now each carrying an `idempotencyKey`, all green.
 
 - [ ] **Step 5: Commit**
 
@@ -1065,7 +1113,7 @@ Deno.test("confirmSettlement requires the creditor's device", {
   const { groupId, a, b } = await seedBowesA2000(d);
   await claimMember(d, { groupId, memberId: a, deviceId: "dev-A" });
   const { settlementId } = await recordSettlement(d, {
-    groupId, fromMemberId: b, toMemberId: a, amountCents: 2000, method: "venmo",
+    groupId, fromMemberId: b, toMemberId: a, amountCents: 2000, method: "venmo", idempotencyKey: "k1",
   });
   // wrong device cannot confirm
   let threw = "";
@@ -1086,7 +1134,7 @@ Deno.test("confirmSettlement is scoped to its group (cross-group id is rejected)
   const { groupId, a, b } = await seedBowesA2000(d);
   await claimMember(d, { groupId, memberId: a, deviceId: "dev-A" });
   const { settlementId } = await recordSettlement(d, {
-    groupId, fromMemberId: b, toMemberId: a, amountCents: 2000, method: "venmo",
+    groupId, fromMemberId: b, toMemberId: a, amountCents: 2000, method: "venmo", idempotencyKey: "k1",
   });
   // group 2: a separate group the attacker legitimately belongs to
   const { groupId: otherGroupId } = await createGroup(d, { title: "other" });
@@ -1182,7 +1230,7 @@ git commit -m "feat: confirmSettlement requires the creditor's bound device"
     - `POST /groups/:id/members` → `{ names: string[] }` → 201 `{ memberIds }` (token)
     - `POST /groups/:id/claim` → `{ memberId, venmoHandle? }` + device header → 200 `{ ok: true }` (token)
     - `GET /groups/:id/balances` → 200 `{ transfers }` (token)
-  - Error mapping: messages containing `unauthorized`/`creditor's device` → 403; `already claimed`/`pending settlement already exists` → 409; `not found`/`no active event`/`no proposed settlement` → 404; otherwise → 400.
+  - Error mapping: messages containing `unauthorized`/`creditor's device` → 403; `already claimed`/`pending settlement already exists`/`different payment details` → 409; `not found`/`no active event`/`no proposed settlement` → 404; otherwise → 400.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1289,7 +1337,7 @@ function json(body: unknown, status = 200): Response {
 
 function statusForError(message: string): number {
   if (/unauthorized|creditor's device/i.test(message)) return 403;
-  if (/already claimed|pending settlement already exists/i.test(message)) return 409;
+  if (/already claimed|pending settlement already exists|different payment details/i.test(message)) return 409;
   if (/not found|no active event|no proposed settlement/i.test(message)) return 404;
   return 400;
 }
@@ -1516,7 +1564,7 @@ git commit -m "feat: HTTP creation routes (splits, pools, loans, orders)"
 
 **Interfaces:**
 - Produces (all require token):
-  - `POST /groups/:id/settlements` → `{ fromMemberId, toMemberId, amountCents, method, idempotencyKey? }` → 201 `{ settlementId }`
+  - `POST /groups/:id/settlements` → `{ fromMemberId, toMemberId, amountCents, method, idempotencyKey }` (key required) → 201 `{ settlementId }`
   - `POST /groups/:gid/settlements/:sid/confirm` → device header → 200 `{ ok: true }` (creditor-device gated)
   - `POST /groups/:gid/events/:eid/void` → 200 `{ ok: true }`
 
@@ -1536,7 +1584,7 @@ Deno.test("settlement record + creditor-device confirm over HTTP", {
     { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
 
   const settle = await handle(req("POST", `/groups/${groupId}/settlements`,
-    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo" }, tok), db);
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo", idempotencyKey: "k1" }, tok), db);
   assertEquals(settle.status, 201);
   const { settlementId } = await settle.json();
 
@@ -1549,6 +1597,19 @@ Deno.test("settlement record + creditor-device confirm over HTTP", {
   assertEquals(ok.status, 200);
   const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
   assertEquals(bal.transfers.length, 0);
+});
+
+Deno.test("POST /settlements without an idempotency key is rejected (400)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
+  const [a, b] = memberIds;
+  await handle(req("POST", `/groups/${groupId}/splits`,
+    { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
+  const res = await handle(req("POST", `/groups/${groupId}/settlements`,
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo" }, tok), db);
+  assertEquals(res.status, 400);
 });
 
 Deno.test("void over HTTP reverses an event", {
@@ -1642,7 +1703,7 @@ Routes:
 - `POST /groups/:id/claim` `{ memberId, venmoHandle? }` (+ device) → `{ ok }`
 - `GET  /groups/:id/balances` → `{ transfers }`
 - `POST /groups/:id/splits | pools | loans | orders` → `{ eventId }`
-- `POST /groups/:id/settlements` `{ fromMemberId, toMemberId, amountCents, method, idempotencyKey? }` → `{ settlementId }`
+- `POST /groups/:id/settlements` `{ fromMemberId, toMemberId, amountCents, method, idempotencyKey }` (key required) → `{ settlementId }`
 - `POST /groups/:gid/settlements/:sid/confirm` (+ creditor device) → `{ ok }`
 - `POST /groups/:gid/events/:eid/void` → `{ ok }`
 ```
