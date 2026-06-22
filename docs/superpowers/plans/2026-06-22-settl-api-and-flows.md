@@ -429,6 +429,8 @@ $$;
 drop function create_split(uuid, text, bigint, uuid, jsonb);
 ```
 
+**On dropping `create_split` immediately (no compatibility wrapper):** in a *deployed* system this would be a version-skew hazard — an older client still calling `create_split` would break the moment the migration lands. It is safe here because Settl is pre-deployment: nothing is running, the sole caller is `repo.createSplit`, and Step 3 updates that caller in the **same task and commit** as this migration, so the schema and code change atomically. **Before the first real deploy** (Plan 3/4 era), revisit this: if any deployed function/client could still call `create_split`, reintroduce it as a thin wrapper over `create_event` and drop it only in a later migration after callers are confirmed updated. Do not add that wrapper now — it would be dead code (YAGNI).
+
 Apply: `supabase migration up` (or `supabase db reset`).
 
 - [ ] **Step 2: Run the existing createSplit tests to verify they now FAIL**
@@ -1236,6 +1238,7 @@ export async function confirmSettlement(
     .from("members")
     .select("device_id")
     .eq("id", s.to_member_id)
+    .eq("group_id", input.groupId) // defense-in-depth: assert the group boundary explicitly
     .single();
   if (e2) throw new Error(`confirmSettlement: ${e2.message}`);
   if (!creditor.device_id || creditor.device_id !== input.deviceId) {
