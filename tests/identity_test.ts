@@ -1,6 +1,6 @@
 import { assert, assertEquals } from "@std/assert";
 import { createClient } from "@supabase/supabase-js";
-import { addMembers, createGroup } from "../supabase/functions/_shared/repo.ts";
+import { addMembers, claimMember, createGroup } from "../supabase/functions/_shared/repo.ts";
 import { authorizeGroup } from "../supabase/functions/_shared/auth.ts";
 
 const url = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
@@ -57,4 +57,49 @@ Deno.test("addMembers rejects an empty names list", {
   let threw = "";
   try { await addMembers(d, { groupId, names: [] }); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes("at least one name"), `expected empty-names error, got: ${threw}`);
+});
+
+async function seedGroup(d: ReturnType<typeof db>, names: string[]) {
+  const { groupId } = await createGroup(d, { title: "t" });
+  const { memberIds } = await addMembers(d, { groupId, names });
+  return { groupId, memberIds };
+}
+
+Deno.test("claimMember binds a device first-come and sets venmo", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = db();
+  const { groupId, memberIds } = await seedGroup(d, ["A", "B"]);
+  await claimMember(d, { groupId, memberId: memberIds[0], deviceId: "dev-1", venmoHandle: "alice" });
+  const { data: m } = await d.from("members").select("claimed, device_id, venmo_handle").eq("id", memberIds[0]).single();
+  assertEquals(m!.claimed, true);
+  assertEquals(m!.device_id, "dev-1");
+  assertEquals(m!.venmo_handle, "alice");
+});
+
+Deno.test("claimMember rejects a different device claiming a held seat", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = db();
+  const { groupId, memberIds } = await seedGroup(d, ["A"]);
+  await claimMember(d, { groupId, memberId: memberIds[0], deviceId: "dev-1" });
+  let threw = "";
+  try {
+    await claimMember(d, { groupId, memberId: memberIds[0], deviceId: "dev-2" });
+  } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("already claimed"), `expected already-claimed, got: ${threw}`);
+});
+
+Deno.test("claimMember is idempotent for the same device (updates venmo)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = db();
+  const { groupId, memberIds } = await seedGroup(d, ["A"]);
+  await claimMember(d, { groupId, memberId: memberIds[0], deviceId: "dev-1", venmoHandle: "old" });
+  await claimMember(d, { groupId, memberId: memberIds[0], deviceId: "dev-1", venmoHandle: "new" });
+  const { data: m } = await d.from("members").select("venmo_handle").eq("id", memberIds[0]).single();
+  assertEquals(m!.venmo_handle, "new");
 });

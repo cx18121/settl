@@ -180,3 +180,21 @@ export async function addMembers(
   if (error) throw new Error(`addMembers: ${error.message}`);
   return { memberIds: (data ?? []).map((m) => m.id as string) };
 }
+
+export interface ClaimMemberInput {
+  groupId: string;
+  memberId: string;
+  deviceId: string;
+  venmoHandle?: string | null;
+}
+
+export async function claimMember(db: SupabaseClient, input: ClaimMemberInput): Promise<void> {
+  const { data, error } = await db.rpc("claim_member", {
+    p_group_id: input.groupId,
+    p_member_id: input.memberId,
+    p_device_id: input.deviceId,
+    p_venmo: input.venmoHandle ?? null,
+  });
+  if (error) throw new Error(`claimMember: ${error.message}`);
+  if (data !== true) throw new Error("member already claimed by another device");
+}
