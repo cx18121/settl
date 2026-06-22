@@ -1014,6 +1014,8 @@ Then, inside `recordSettlement`, keep the existing validation (positive amount, 
   return { settlementId: data as string };
 ```
 
+**Concurrency safety model (read this — the TS validation runs *before* the lock by design):** the only outcome that corrupts the ledger is counting the *same* payment twice, and that is closed *inside* the advisory lock by the idempotency-key dedup. Duplicate *pending* proposals are closed by the `settlements_idempotency_key`-sibling partial unique index (a hard DB constraint — the second concurrent insert fails even if the TS check raced). The remaining racy check, `amount ≤ outstanding`, is a **best-effort fat-finger guard, not a ledger invariant**: two genuine concurrent payments (different idempotency keys) can both pass it and produce an overpay, which is **economically valid** (the recipient simply now owes the difference; net positions still sum to zero, and it's group-visible and disputable). We deliberately do **not** reimplement the netting engine in SQL to make this guard airtight — that would duplicate the tested TS engine to defend a guard whose failure mode is acceptable. Do not "fix" this by moving netting into the RPC.
+
 - [ ] **Step 4: Run the new test AND the existing settlement tests to verify all pass**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settlement2_test.ts tests/repo_test.ts --allow-env --allow-net --allow-read`
@@ -1037,8 +1039,8 @@ git commit -m "feat: record_settlement RPC (per-group advisory lock + idempotenc
 
 **Interfaces:**
 - Produces:
-  - `interface ConfirmSettlementInput { settlementId: string; deviceId: string }`
-  - `async function confirmSettlement(db, input: ConfirmSettlementInput): Promise<void>` — flips a `proposed` settlement to `confirmed` **only if** `deviceId` matches the creditor (`to_member`)'s bound `device_id`; throws `"only the creditor's device may confirm"` otherwise, and `"no proposed settlement found to confirm"` if nothing matched.
+  - `interface ConfirmSettlementInput { groupId: string; settlementId: string; deviceId: string }`
+  - `async function confirmSettlement(db, input: ConfirmSettlementInput): Promise<void>` — flips a `proposed` settlement to `confirmed` **only if** the settlement belongs to `groupId` (tenant scope) **and** `deviceId` matches the creditor (`to_member`)'s bound `device_id`; throws `"settlement not found"` if it isn't in this group, `"only the creditor's device may confirm"` on device mismatch, and `"no proposed settlement found to confirm"` if nothing matched. The `groupId` scope is load-bearing: the HTTP route only authorizes the URL's group token, so without scoping the lookup+update by `group_id` a caller with one group's token could confirm a settlement in another group.
 
 - [ ] **Step 1: Update the existing confirm test in `tests/repo_test.ts` to the new signature, and add the wrong-device test in `tests/settlement2_test.ts`**
 
@@ -1047,7 +1049,7 @@ In `tests/repo_test.ts`, the existing test "confirmed settlement clears the nett
   // creditor A claims a device so they can confirm receipt
   await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
   // ...after recordSettlement returns { settlementId }:
-  await confirmSettlement(db, { settlementId, deviceId: "dev-A" });
+  await confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" });
 ```
 Add `claimMember` (and keep `confirmSettlement`) to the existing import from `repo.ts` at the top of `tests/repo_test.ts`. The members in that test are created via the file's `seedGroupWithMembers` helper which returns `{ groupId, members }`; use the returned `groupId` and `a.id` for the claim.
 
@@ -1067,25 +1069,49 @@ Deno.test("confirmSettlement requires the creditor's device", {
   });
   // wrong device cannot confirm
   let threw = "";
-  try { await confirmSettlement(d, { settlementId, deviceId: "dev-evil" }); } catch (e) { threw = (e as Error).message; }
+  try { await confirmSettlement(d, { groupId, settlementId, deviceId: "dev-evil" }); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes("creditor's device"), `expected creditor-device error, got: ${threw}`);
   assertEquals((await getNettedTransfers(d, groupId)).length, 1, "still owed after rejected confirm");
   // creditor's device confirms
-  await confirmSettlement(d, { settlementId, deviceId: "dev-A" });
+  await confirmSettlement(d, { groupId, settlementId, deviceId: "dev-A" });
   assertEquals((await getNettedTransfers(d, groupId)).length, 0);
 });
+
+Deno.test("confirmSettlement is scoped to its group (cross-group id is rejected)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  // group 1: B owes A, A claims dev-A, a proposed venmo settlement exists
+  const { groupId, a, b } = await seedBowesA2000(d);
+  await claimMember(d, { groupId, memberId: a, deviceId: "dev-A" });
+  const { settlementId } = await recordSettlement(d, {
+    groupId, fromMemberId: b, toMemberId: a, amountCents: 2000, method: "venmo",
+  });
+  // group 2: a separate group the attacker legitimately belongs to
+  const { groupId: otherGroupId } = await createGroup(d, { title: "other" });
+  // even WITH the creditor device, the settlement cannot be confirmed via another group's id
+  let threw = "";
+  try {
+    await confirmSettlement(d, { groupId: otherGroupId, settlementId, deviceId: "dev-A" });
+  } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("settlement not found"), `expected not-found, got: ${threw}`);
+  assertEquals((await getNettedTransfers(d, groupId)).length, 1, "group-1 debt untouched");
+});
 ```
+The cross-group test also needs `createGroup` imported into `tests/settlement2_test.ts` (extend the existing `repo.ts` import).
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settlement2_test.ts tests/repo_test.ts --allow-env --allow-net --allow-read`
-Expected: FAIL — `confirmSettlement` still takes a string, not `{ settlementId, deviceId }`; the new device check doesn't exist.
+Expected: FAIL — `confirmSettlement` still takes a string, not `{ groupId, settlementId, deviceId }`; the device check and group scoping don't exist.
 
 - [ ] **Step 3: Implement the new `confirmSettlement`**
 
 In `supabase/functions/_shared/repo.ts`, replace the existing `confirmSettlement` with:
 ```ts
 export interface ConfirmSettlementInput {
+  groupId: string;
   settlementId: string;
   deviceId: string;
 }
@@ -1094,10 +1120,13 @@ export async function confirmSettlement(
   db: SupabaseClient,
   input: ConfirmSettlementInput,
 ): Promise<void> {
+  // Scope the lookup to the group (tenant boundary): a settlement id from
+  // another group must not be confirmable with this group's token.
   const { data: s, error: e1 } = await db
     .from("settlements")
     .select("id, to_member_id")
     .eq("id", input.settlementId)
+    .eq("group_id", input.groupId)
     .maybeSingle();
   if (e1) throw new Error(`confirmSettlement: ${e1.message}`);
   if (!s) throw new Error("settlement not found");
@@ -1116,6 +1145,7 @@ export async function confirmSettlement(
     .from("settlements")
     .update({ status: "confirmed" })
     .eq("id", input.settlementId)
+    .eq("group_id", input.groupId)
     .eq("status", "proposed")
     .select("id");
   if (error) throw new Error(`confirmSettlement: ${error.message}`);
@@ -1126,7 +1156,7 @@ export async function confirmSettlement(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settlement2_test.ts tests/repo_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS — updated confirm test + new wrong-device test green.
+Expected: PASS — updated confirm test + new wrong-device test + new cross-group-scope test green.
 
 - [ ] **Step 5: Commit**
 
@@ -1583,7 +1613,7 @@ Then, after the `parts.length >= 3` group block, add handling for the 4-segment 
       await authorizeGroup(db, groupId, token);
       if (parts[2] === "settlements" && parts[4] === "confirm") {
         if (!device) throw new Error("missing device id");
-        await confirmSettlement(db, { settlementId: parts[3], deviceId: device });
+        await confirmSettlement(db, { groupId, settlementId: parts[3], deviceId: device });
         return json({ ok: true }, 200);
       }
       if (parts[2] === "events" && parts[4] === "void") {
