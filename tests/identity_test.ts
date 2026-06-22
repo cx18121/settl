@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert } from "@std/assert";
 import { createClient } from "@supabase/supabase-js";
 
 const url = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
