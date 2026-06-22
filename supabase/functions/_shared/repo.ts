@@ -149,3 +149,34 @@ export async function confirmSettlement(db: SupabaseClient, settlementId: string
     throw new Error("no proposed settlement found to confirm");
   }
 }
+
+export async function createGroup(
+  db: SupabaseClient,
+  input: { title: string | null },
+): Promise<{ groupId: string; inviteToken: string }> {
+  const { data, error } = await db
+    .from("groups")
+    .insert({ title: input.title })
+    .select("id, invite_token")
+    .single();
+  if (error) throw new Error(`createGroup: ${error.message}`);
+  return { groupId: data!.id as string, inviteToken: data!.invite_token as string };
+}
+
+export interface AddMembersInput {
+  groupId: string;
+  names: string[];
+}
+
+export async function addMembers(
+  db: SupabaseClient,
+  input: AddMembersInput,
+): Promise<{ memberIds: string[] }> {
+  if (input.names.length === 0) throw new Error("addMembers needs at least one name");
+  const { data, error } = await db
+    .from("members")
+    .insert(input.names.map((n) => ({ group_id: input.groupId, display_name: n })))
+    .select("id");
+  if (error) throw new Error(`addMembers: ${error.message}`);
+  return { memberIds: (data ?? []).map((m) => m.id as string) };
+}
