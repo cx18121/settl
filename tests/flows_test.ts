@@ -4,6 +4,7 @@ import {
   addMembers,
   createGroup,
   createLoan,
+  createOrder,
   createPool,
   getNettedTransfers,
 } from "../supabase/functions/_shared/repo.ts";
@@ -63,4 +64,30 @@ Deno.test("createLoan: borrower owes lender the full amount", {
   assertEquals(transfers[0].fromMemberId, borrower);
   assertEquals(transfers[0].toMemberId, lender);
   assertEquals(transfers[0].amountCents, 5000);
+});
+
+Deno.test("createOrder: each item becomes that member's share to the payer", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, memberIds } = await seed(d, ["Payer", "B", "C"]);
+  const [payer, b, c] = memberIds;
+  const { eventId } = await createOrder(d, {
+    groupId,
+    payerMemberId: payer,
+    title: "boba run",
+    items: [
+      { memberId: b, amountCents: 650 },
+      { memberId: c, amountCents: 720 },
+    ],
+  });
+  const { data: ev } = await d.from("events").select("type, total_cents").eq("id", eventId).single();
+  assertEquals(ev!.type, "order");
+  assertEquals(Number(ev!.total_cents), 1370);
+  const transfers = await getNettedTransfers(d, groupId);
+  const byFrom = Object.fromEntries(transfers.map((t) => [t.fromMemberId, t.amountCents]));
+  assertEquals(byFrom[b], 650);
+  assertEquals(byFrom[c], 720);
+  assertEquals(transfers.every((t) => t.toMemberId === payer), true);
 });

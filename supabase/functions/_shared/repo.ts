@@ -251,3 +251,34 @@ export async function createLoan(
   if (error) throw new Error(`createLoan: ${error.message}`);
   return { eventId: data as string };
 }
+
+export interface OrderItem {
+  memberId: string;
+  amountCents: number;
+}
+
+export interface CreateOrderInput {
+  groupId: string;
+  payerMemberId: string;
+  title: string | null;
+  items: OrderItem[];
+}
+
+export async function createOrder(
+  db: SupabaseClient,
+  input: CreateOrderInput,
+): Promise<{ eventId: string }> {
+  if (input.items.length === 0) throw new Error("createOrder needs at least one item");
+  const total = input.items.reduce((a, i) => a + i.amountCents, 0);
+  const { data, error } = await db.rpc("create_event", {
+    p_group_id: input.groupId,
+    p_type: "order",
+    p_title: input.title,
+    p_total_cents: total,
+    p_payer_member_id: input.payerMemberId,
+    p_target_cents: null,
+    p_shares: input.items.map((i) => ({ member_id: i.memberId, amount_cents: i.amountCents })),
+  });
+  if (error) throw new Error(`createOrder: ${error.message}`);
+  return { eventId: data as string };
+}
