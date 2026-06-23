@@ -282,3 +282,28 @@ export async function createOrder(
   if (error) throw new Error(`createOrder: ${error.message}`);
   return { eventId: data as string };
 }
+
+export async function voidEvent(
+  db: SupabaseClient,
+  input: { groupId: string; eventId: string; deviceId: string },
+): Promise<void> {
+  const { data: actor, error: aErr } = await db
+    .from("members")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("device_id", input.deviceId)
+    .eq("claimed", true)
+    .maybeSingle();
+  if (aErr) throw new Error(`voidEvent: ${aErr.message}`);
+  if (!actor) throw new Error("unauthorized: void requires a claimed member of this group");
+
+  const { data, error } = await db
+    .from("events")
+    .update({ voided: true, voided_by_member_id: actor.id, voided_at: new Date().toISOString() })
+    .eq("id", input.eventId)
+    .eq("group_id", input.groupId)
+    .eq("voided", false)
+    .select("id");
+  if (error) throw new Error(`voidEvent: ${error.message}`);
+  if (!data || data.length === 0) throw new Error("no active event found to void");
+}
