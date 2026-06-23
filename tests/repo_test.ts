@@ -1,6 +1,6 @@
 import { assertEquals, assert } from "@std/assert";
 import { makeDb } from "../supabase/functions/_shared/db.ts";
-import { createSplit, getNettedTransfers, recordSettlement, confirmSettlement } from "../supabase/functions/_shared/repo.ts";
+import { createSplit, getNettedTransfers, recordSettlement, confirmSettlement, claimMember } from "../supabase/functions/_shared/repo.ts";
 
 async function seedGroupWithMembers(db: ReturnType<typeof makeDb>, names: string[]) {
   const { data: g } = await db.from("groups").insert({ title: "test" }).select().single();
@@ -71,7 +71,6 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, members } = await seedGroupWithMembers(db, ["A", "B"]);
-    // a member that belongs to a DIFFERENT group
     const { data: other } = await db.from("groups").insert({ title: "other" }).select().single();
     const { data: outsider } = await db
       .from("members")
@@ -88,7 +87,7 @@ Deno.test({
         payerMemberId: members[0].id,
         shares: [
           { memberId: members[1].id, amountCents: 1000 },
-          { memberId: outsider!.id, amountCents: 1000 }, // outsider violates the composite FK
+          { memberId: outsider!.id, amountCents: 1000 },
         ],
       });
     } catch (e) {
@@ -96,7 +95,6 @@ Deno.test({
     }
     assert(msg.includes("createSplit:"), `expected createSplit error, got: ${msg}`);
     assert(/foreign key|violates|constraint/i.test(msg), `expected FK-violation error, got: ${msg}`);
-    // the event insert must have rolled back — no orphan event left in the group
     const { data: events } = await db.from("events").select("id").eq("group_id", groupId);
     assertEquals(events!.length, 0);
   },
@@ -110,7 +108,6 @@ Deno.test({
     const db = makeDb();
     const { groupId, members } = await seedGroupWithMembers(db, ["A", "B", "C"]);
     const [a, b, c] = members;
-    // A pays 30, split B/C 15 each → B owes A 15, C owes A 15
     await createSplit(db, {
       groupId,
       title: "Dinner",
@@ -123,7 +120,6 @@ Deno.test({
     });
 
     const transfers = await getNettedTransfers(db, groupId);
-    // both debtors pay A; 2 transfers, each 1500, all to A
     assertEquals(transfers.length, 2);
     for (const t of transfers) {
       assertEquals(t.toMemberId, a.id);
@@ -147,20 +143,22 @@ Deno.test({
       payerMemberId: a.id,
       shares: [{ memberId: b.id, amountCents: 2000 }],
     });
-    // before: B owes A 2000
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     const { settlementId } = await recordSettlement(db, {
       groupId,
       fromMemberId: b.id,
       toMemberId: a.id,
       amountCents: 2000,
       method: "venmo",
+      idempotencyKey: "k1",
+      deviceId: "dev-B",
     });
-    // venmo settlement starts 'proposed' → still owed until confirmed
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
-    await confirmSettlement(db, settlementId);
+    await confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" });
     assertEquals((await getNettedTransfers(db, groupId)).length, 0);
   },
 });
@@ -177,8 +175,10 @@ Deno.test({
       groupId, title: "x", totalCents: 1000, payerMemberId: a.id,
       shares: [{ memberId: b.id, amountCents: 1000 }],
     });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     await recordSettlement(db, {
       groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 1000, method: "cash",
+      idempotencyKey: "k1", deviceId: "dev-B",
     });
     assertEquals((await getNettedTransfers(db, groupId)).length, 0);
   },
@@ -191,7 +191,7 @@ async function seedBowesA2000(db: ReturnType<typeof makeDb>) {
     groupId, title: "x", totalCents: 2000, payerMemberId: a.id,
     shares: [{ memberId: b.id, amountCents: 2000 }],
   });
-  return { groupId, a, b }; // B owes A 2000
+  return { groupId, a, b };
 }
 
 async function expectThrows(fn: () => Promise<unknown>, needle: string) {
@@ -211,9 +211,9 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    // A does not owe B — paying A→B must be refused
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash" }),
+      () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash", idempotencyKey: "k1", deviceId: "dev-A" }),
       "no outstanding debt",
     );
   },
@@ -226,8 +226,9 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash" }),
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash", idempotencyKey: "k1", deviceId: "dev-B" }),
       "exceeds outstanding",
     );
   },
@@ -240,7 +241,8 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash", idempotencyKey: "k1", deviceId: "dev-B" });
     const transfers = await getNettedTransfers(db, groupId);
     assertEquals(transfers.length, 1);
     assertEquals(transfers[0].fromMemberId, b.id);
@@ -256,9 +258,10 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k1", deviceId: "dev-B" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo" }),
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k2", deviceId: "dev-B" }),
       "pending settlement already exists",
     );
   },
@@ -271,10 +274,12 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    // a cash settlement is already confirmed; confirming it again must fail
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     const { settlementId } = await recordSettlement(db, {
       groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "cash",
+      idempotencyKey: "k1", deviceId: "dev-B",
     });
-    await expectThrows(() => confirmSettlement(db, settlementId), "no proposed settlement");
+    await expectThrows(() => confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" }), "no proposed settlement");
   },
 });
