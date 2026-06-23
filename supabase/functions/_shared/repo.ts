@@ -94,6 +94,18 @@ export async function recordSettlement(
     throw new Error("idempotencyKey is required");
   }
 
+  const { data: actor, error: aErr } = await db
+    .from("members")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("device_id", input.deviceId)
+    .eq("claimed", true)
+    .in("id", [input.fromMemberId, input.toMemberId])
+    .limit(1)
+    .maybeSingle();
+  if (aErr) throw new Error(`recordSettlement auth: ${aErr.message}`);
+  if (!actor) throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+
   const { data: existing, error: iErr } = await db
     .from("settlements")
     .select("id, from_member_id, to_member_id, amount_cents, method")
@@ -112,18 +124,6 @@ export async function recordSettlement(
     }
     throw new Error("idempotency key reused with different payment details");
   }
-
-  const { data: actor, error: aErr } = await db
-    .from("members")
-    .select("id")
-    .eq("group_id", input.groupId)
-    .eq("device_id", input.deviceId)
-    .eq("claimed", true)
-    .in("id", [input.fromMemberId, input.toMemberId])
-    .limit(1)
-    .maybeSingle();
-  if (aErr) throw new Error(`recordSettlement auth: ${aErr.message}`);
-  if (!actor) throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
 
   if (input.amountCents <= 0) throw new Error("settlement amount must be positive");
 
