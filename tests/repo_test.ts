@@ -1,6 +1,6 @@
 import { assertEquals, assert } from "@std/assert";
 import { makeDb } from "../supabase/functions/_shared/db.ts";
-import { createSplit, getNettedTransfers, recordSettlement, confirmSettlement } from "../supabase/functions/_shared/repo.ts";
+import { createSplit, getNettedTransfers, recordSettlement, confirmSettlement, claimMember } from "../supabase/functions/_shared/repo.ts";
 
 async function seedGroupWithMembers(db: ReturnType<typeof makeDb>, names: string[]) {
   const { data: g } = await db.from("groups").insert({ title: "test" }).select().single();
@@ -150,6 +150,7 @@ Deno.test({
     // before: B owes A 2000
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
     const { settlementId } = await recordSettlement(db, {
       groupId,
       fromMemberId: b.id,
@@ -161,7 +162,7 @@ Deno.test({
     // venmo settlement starts 'proposed' → still owed until confirmed
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
-    await confirmSettlement(db, settlementId);
+    await confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" });
     assertEquals((await getNettedTransfers(db, groupId)).length, 0);
   },
 });
@@ -273,11 +274,11 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    // a cash settlement is already confirmed; confirming it again must fail
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
     const { settlementId } = await recordSettlement(db, {
       groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "cash",
       idempotencyKey: "k1",
     });
-    await expectThrows(() => confirmSettlement(db, settlementId), "no proposed settlement");
+    await expectThrows(() => confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" }), "no proposed settlement");
   },
 });

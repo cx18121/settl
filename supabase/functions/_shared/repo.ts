@@ -132,18 +132,45 @@ export async function recordSettlement(
   return { settlementId: data as string };
 }
 
-export async function confirmSettlement(db: SupabaseClient, settlementId: string): Promise<void> {
-  // Only ever flip a currently-proposed row; matching zero rows is an error (bad id / already confirmed).
+export interface ConfirmSettlementInput {
+  groupId: string;
+  settlementId: string;
+  deviceId: string;
+}
+
+export async function confirmSettlement(
+  db: SupabaseClient,
+  input: ConfirmSettlementInput,
+): Promise<void> {
+  const { data: s, error: e1 } = await db
+    .from("settlements")
+    .select("id, to_member_id")
+    .eq("id", input.settlementId)
+    .eq("group_id", input.groupId)
+    .maybeSingle();
+  if (e1) throw new Error(`confirmSettlement: ${e1.message}`);
+  if (!s) throw new Error("settlement not found");
+
+  const { data: creditor, error: e2 } = await db
+    .from("members")
+    .select("device_id")
+    .eq("id", s.to_member_id)
+    .eq("group_id", input.groupId)
+    .single();
+  if (e2) throw new Error(`confirmSettlement: ${e2.message}`);
+  if (!creditor.device_id || creditor.device_id !== input.deviceId) {
+    throw new Error("only the creditor's device may confirm this settlement");
+  }
+
   const { data, error } = await db
     .from("settlements")
     .update({ status: "confirmed" })
-    .eq("id", settlementId)
+    .eq("id", input.settlementId)
+    .eq("group_id", input.groupId)
     .eq("status", "proposed")
     .select("id");
   if (error) throw new Error(`confirmSettlement: ${error.message}`);
-  if (!data || data.length === 0) {
-    throw new Error("no proposed settlement found to confirm");
-  }
+  if (!data || data.length === 0) throw new Error("no proposed settlement found to confirm");
 }
 
 export async function createGroup(
