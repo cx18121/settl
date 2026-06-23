@@ -226,3 +226,28 @@ export async function createPool(
   if (error) throw new Error(`createPool: ${error.message}`);
   return { eventId: data as string };
 }
+
+export interface CreateLoanInput {
+  groupId: string;
+  lenderMemberId: string;
+  borrowerMemberId: string;
+  amountCents: number;
+  title?: string | null;
+}
+
+export async function createLoan(
+  db: SupabaseClient,
+  input: CreateLoanInput,
+): Promise<{ eventId: string }> {
+  const { data, error } = await db.rpc("create_event", {
+    p_group_id: input.groupId,
+    p_type: "loan",
+    p_title: input.title ?? null,
+    p_total_cents: input.amountCents,
+    p_payer_member_id: input.lenderMemberId,
+    p_target_cents: null,
+    p_shares: [{ member_id: input.borrowerMemberId, amount_cents: input.amountCents }],
+  });
+  if (error) throw new Error(`createLoan: ${error.message}`);
+  return { eventId: data as string };
+}
