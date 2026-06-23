@@ -16,7 +16,6 @@ export async function createSplit(
   db: SupabaseClient,
   input: CreateSplitInput,
 ): Promise<{ eventId: string }> {
-  // fast client-side check (unit-tested); the RPC re-validates as the authoritative backstop
   assertSharesSumTo(
     input.totalCents,
     input.shares.map((s) => ({ memberId: s.memberId, amountCents: s.amountCents })),
