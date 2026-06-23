@@ -314,6 +314,7 @@ export async function voidEvent(
     .eq("group_id", input.groupId)
     .eq("device_id", input.deviceId)
     .eq("claimed", true)
+    .limit(1)
     .maybeSingle();
   if (aErr) throw new Error(`voidEvent: ${aErr.message}`);
   if (!actor) throw new Error("unauthorized: void requires a claimed member of this group");

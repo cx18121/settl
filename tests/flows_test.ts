@@ -150,3 +150,20 @@ Deno.test("voidEvent throws when the event is already voided or missing", {
   try { await voidEvent(d, { groupId, eventId, deviceId: "dev-A" }); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes("no active event"), `expected no-active-event, got: ${threw}`);
 });
+
+Deno.test("voidEvent works when one device holds multiple claimed seats", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, memberIds } = await seed(d, ["A", "B", "C"]);
+  const [a, b, c] = memberIds;
+  await claimMember(d, { groupId, memberId: a, deviceId: "dev-X" });
+  await claimMember(d, { groupId, memberId: b, deviceId: "dev-X" });
+  const { eventId } = await createSplit(d, {
+    groupId, title: "x", totalCents: 1000, payerMemberId: a,
+    shares: [{ memberId: c, amountCents: 1000 }],
+  });
+  await voidEvent(d, { groupId, eventId, deviceId: "dev-X" });
+  assertEquals((await getNettedTransfers(d, groupId)).length, 0);
+});
