@@ -83,17 +83,18 @@ export interface RecordSettlementInput {
   toMemberId: string;
   amountCents: number;
   method: "venmo" | "apple_cash" | "cash" | "other";
+  idempotencyKey: string;
 }
 
 export async function recordSettlement(
   db: SupabaseClient,
   input: RecordSettlementInput,
 ): Promise<{ settlementId: string }> {
+  if (!input.idempotencyKey || input.idempotencyKey.trim() === "") {
+    throw new Error("idempotencyKey is required");
+  }
   if (input.amountCents <= 0) throw new Error("settlement amount must be positive");
 
-  // The payment must match a real outstanding netted debt from->to, amount <= outstanding.
-  // (getNettedTransfers reflects only CONFIRMED settlements, so a pending proposed one does
-  // not shrink the outstanding here — the duplicate-guard below stops a double submit.)
   const outstanding = (await getNettedTransfers(db, input.groupId)).find(
     (t) => t.fromMemberId === input.fromMemberId && t.toMemberId === input.toMemberId,
   );
@@ -104,9 +105,6 @@ export async function recordSettlement(
     throw new Error(`amount ${input.amountCents} exceeds outstanding ${outstanding.amountCents}`);
   }
 
-  // Double-submit guard: at most one pending settlement per from->to pair.
-  // This gives a friendly error; the `one_pending_settlement_per_pair` unique
-  // index is the real backstop that also holds under concurrent submissions.
   const { data: pending, error: pErr } = await db
     .from("settlements")
     .select("id")
@@ -120,22 +118,18 @@ export async function recordSettlement(
     throw new Error("a pending settlement already exists for this pair");
   }
 
-  // Venmo settlements await the recipient's confirmation; manual marks are self-confirmed.
   const status = input.method === "venmo" ? "proposed" : "confirmed";
-  const { data, error } = await db
-    .from("settlements")
-    .insert({
-      group_id: input.groupId,
-      from_member_id: input.fromMemberId,
-      to_member_id: input.toMemberId,
-      amount_cents: input.amountCents,
-      method: input.method,
-      status,
-    })
-    .select()
-    .single();
+  const { data, error } = await db.rpc("record_settlement", {
+    p_group_id: input.groupId,
+    p_from: input.fromMemberId,
+    p_to: input.toMemberId,
+    p_amount: input.amountCents,
+    p_method: input.method,
+    p_status: status,
+    p_idempotency_key: input.idempotencyKey,
+  });
   if (error) throw new Error(`recordSettlement: ${error.message}`);
-  return { settlementId: data!.id as string };
+  return { settlementId: data as string };
 }
 
 export async function confirmSettlement(db: SupabaseClient, settlementId: string): Promise<void> {
