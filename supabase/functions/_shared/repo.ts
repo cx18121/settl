@@ -340,16 +340,34 @@ export async function voidEvent(
   db: SupabaseClient,
   input: { groupId: string; eventId: string; deviceId: string },
 ): Promise<void> {
+  const { data: ev, error: evErr } = await db
+    .from("events")
+    .select("id, payer_member_id")
+    .eq("id", input.eventId)
+    .eq("group_id", input.groupId)
+    .eq("voided", false)
+    .maybeSingle();
+  if (evErr) throw new Error(`voidEvent: ${evErr.message}`);
+  if (!ev) throw new Error("no active event found to void");
+
+  const { data: shareRows, error: shErr } = await db
+    .from("shares")
+    .select("member_id")
+    .eq("event_id", input.eventId);
+  if (shErr) throw new Error(`voidEvent: ${shErr.message}`);
+  const partyIds = [ev.payer_member_id, ...(shareRows ?? []).map((r) => r.member_id)];
+
   const { data: actor, error: aErr } = await db
     .from("members")
     .select("id")
     .eq("group_id", input.groupId)
     .eq("device_id", input.deviceId)
     .eq("claimed", true)
+    .in("id", partyIds)
     .limit(1)
     .maybeSingle();
   if (aErr) throw new Error(`voidEvent: ${aErr.message}`);
-  if (!actor) throw new Error("unauthorized: void requires a claimed member of this group");
+  if (!actor) throw new Error("unauthorized: only a participant of this event may void it");
 
   const { data, error } = await db
     .from("events")

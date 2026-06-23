@@ -129,7 +129,7 @@ Deno.test("voidEvent rejects a caller with no claimed seat in the group", {
   });
   let threw = "";
   try { await voidEvent(d, { groupId, eventId, deviceId: "dev-nobody" }); } catch (e) { threw = (e as Error).message; }
-  assert(threw.includes("claimed member"), `expected claimed-member error, got: ${threw}`);
+  assert(threw.includes("participant"), `expected participant error, got: ${threw}`);
   assertEquals((await getNettedTransfers(d, groupId)).length, 1, "debt untouched after rejected void");
 });
 
@@ -166,4 +166,22 @@ Deno.test("voidEvent works when one device holds multiple claimed seats", {
   });
   await voidEvent(d, { groupId, eventId, deviceId: "dev-X" });
   assertEquals((await getNettedTransfers(d, groupId)).length, 0);
+});
+
+Deno.test("voidEvent rejects a claimed member who is not a party to the event", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const d = makeDb();
+  const { groupId, memberIds } = await seed(d, ["A", "B", "C"]);
+  const [a, b, c] = memberIds;
+  await claimMember(d, { groupId, memberId: c, deviceId: "dev-C" });
+  const { eventId } = await createSplit(d, {
+    groupId, title: "x", totalCents: 1000, payerMemberId: a,
+    shares: [{ memberId: b, amountCents: 1000 }],
+  });
+  let threw = "";
+  try { await voidEvent(d, { groupId, eventId, deviceId: "dev-C" }); } catch (e) { threw = (e as Error).message; }
+  assert(threw.includes("participant"), `expected participant error, got: ${threw}`);
+  assertEquals((await getNettedTransfers(d, groupId)).length, 1);
 });
