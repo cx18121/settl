@@ -83,6 +83,7 @@ export interface RecordSettlementInput {
   amountCents: number;
   method: "venmo" | "apple_cash" | "cash" | "other";
   idempotencyKey: string;
+  deviceId: string;
 }
 
 export async function recordSettlement(
@@ -92,6 +93,38 @@ export async function recordSettlement(
   if (!input.idempotencyKey || input.idempotencyKey.trim() === "") {
     throw new Error("idempotencyKey is required");
   }
+
+  const { data: existing, error: iErr } = await db
+    .from("settlements")
+    .select("id, from_member_id, to_member_id, amount_cents, method")
+    .eq("group_id", input.groupId)
+    .eq("idempotency_key", input.idempotencyKey)
+    .maybeSingle();
+  if (iErr) throw new Error(`recordSettlement idempotency check: ${iErr.message}`);
+  if (existing) {
+    if (
+      existing.from_member_id === input.fromMemberId &&
+      existing.to_member_id === input.toMemberId &&
+      Number(existing.amount_cents) === input.amountCents &&
+      existing.method === input.method
+    ) {
+      return { settlementId: existing.id as string };
+    }
+    throw new Error("idempotency key reused with different payment details");
+  }
+
+  const { data: actor, error: aErr } = await db
+    .from("members")
+    .select("id")
+    .eq("group_id", input.groupId)
+    .eq("device_id", input.deviceId)
+    .eq("claimed", true)
+    .in("id", [input.fromMemberId, input.toMemberId])
+    .limit(1)
+    .maybeSingle();
+  if (aErr) throw new Error(`recordSettlement auth: ${aErr.message}`);
+  if (!actor) throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+
   if (input.amountCents <= 0) throw new Error("settlement amount must be positive");
 
   const outstanding = (await getNettedTransfers(db, input.groupId)).find(

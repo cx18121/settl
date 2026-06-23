@@ -121,11 +121,13 @@ Deno.test("settlement record + creditor-device confirm over HTTP", {
   const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
   const [a, b] = memberIds;
   await handle(req("POST", `/groups/${groupId}/claim`, { memberId: a }, { ...tok, "x-settl-device": "dev-A" }), db);
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: b }, { ...tok, "x-settl-device": "dev-B" }), db);
   await handle(req("POST", `/groups/${groupId}/splits`,
     { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
 
   const settle = await handle(req("POST", `/groups/${groupId}/settlements`,
-    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo", idempotencyKey: "k1" }, tok), db);
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo", idempotencyKey: "k1" },
+    { ...tok, "x-settl-device": "dev-B" }), db);
   assertEquals(settle.status, 201);
   const { settlementId } = await settle.json();
 
@@ -148,6 +150,20 @@ Deno.test("POST /settlements without an idempotency key is rejected (400)", {
     { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
   const res = await handle(req("POST", `/groups/${groupId}/settlements`,
     { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo" }, tok), db);
+  assertEquals(res.status, 400);
+});
+
+Deno.test("POST /settlements without x-settl-device is rejected (400)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
+  const [a, b] = memberIds;
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: b }, { ...tok, "x-settl-device": "dev-B" }), db);
+  await handle(req("POST", `/groups/${groupId}/splits`,
+    { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
+  const res = await handle(req("POST", `/groups/${groupId}/settlements`,
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo", idempotencyKey: "k1" }, tok), db);
   assertEquals(res.status, 400);
 });
 

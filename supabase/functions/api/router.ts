@@ -113,6 +113,7 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
 
       if (req.method === "POST" && sub === "settlements" && parts.length === 3) {
         await authorizeGroup(db, groupId, token);
+        if (!device) throw new Error("missing device id");
         const b = await body();
         const out = await recordSettlement(db, {
           groupId,
@@ -121,6 +122,7 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
           amountCents: b.amountCents,
           method: b.method,
           idempotencyKey: b.idempotencyKey,
+          deviceId: device,
         });
         return json(out, 201);
       }

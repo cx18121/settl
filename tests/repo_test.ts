@@ -146,6 +146,7 @@ Deno.test({
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
     await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     const { settlementId } = await recordSettlement(db, {
       groupId,
       fromMemberId: b.id,
@@ -153,6 +154,7 @@ Deno.test({
       amountCents: 2000,
       method: "venmo",
       idempotencyKey: "k1",
+      deviceId: "dev-B",
     });
     assertEquals((await getNettedTransfers(db, groupId)).length, 1);
 
@@ -173,9 +175,10 @@ Deno.test({
       groupId, title: "x", totalCents: 1000, payerMemberId: a.id,
       shares: [{ memberId: b.id, amountCents: 1000 }],
     });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     await recordSettlement(db, {
       groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 1000, method: "cash",
-      idempotencyKey: "k1",
+      idempotencyKey: "k1", deviceId: "dev-B",
     });
     assertEquals((await getNettedTransfers(db, groupId)).length, 0);
   },
@@ -208,8 +211,9 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
+    await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash", idempotencyKey: "k1" }),
+      () => recordSettlement(db, { groupId, fromMemberId: a.id, toMemberId: b.id, amountCents: 500, method: "cash", idempotencyKey: "k1", deviceId: "dev-A" }),
       "no outstanding debt",
     );
   },
@@ -222,8 +226,9 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash", idempotencyKey: "k1" }),
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2500, method: "cash", idempotencyKey: "k1", deviceId: "dev-B" }),
       "exceeds outstanding",
     );
   },
@@ -236,7 +241,8 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash", idempotencyKey: "k1" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 500, method: "cash", idempotencyKey: "k1", deviceId: "dev-B" });
     const transfers = await getNettedTransfers(db, groupId);
     assertEquals(transfers.length, 1);
     assertEquals(transfers[0].fromMemberId, b.id);
@@ -252,9 +258,10 @@ Deno.test({
   async fn() {
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
-    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k1" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
+    await recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k1", deviceId: "dev-B" });
     await expectThrows(
-      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k2" }),
+      () => recordSettlement(db, { groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "venmo", idempotencyKey: "k2", deviceId: "dev-B" }),
       "pending settlement already exists",
     );
   },
@@ -268,9 +275,10 @@ Deno.test({
     const db = makeDb();
     const { groupId, a, b } = await seedBowesA2000(db);
     await claimMember(db, { groupId, memberId: a.id, deviceId: "dev-A" });
+    await claimMember(db, { groupId, memberId: b.id, deviceId: "dev-B" });
     const { settlementId } = await recordSettlement(db, {
       groupId, fromMemberId: b.id, toMemberId: a.id, amountCents: 2000, method: "cash",
-      idempotencyKey: "k1",
+      idempotencyKey: "k1", deviceId: "dev-B",
     });
     await expectThrows(() => confirmSettlement(db, { groupId, settlementId, deviceId: "dev-A" }), "no proposed settlement");
   },
