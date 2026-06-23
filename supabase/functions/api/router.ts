@@ -3,12 +3,15 @@ import { authorizeGroup } from "../_shared/auth.ts";
 import {
   addMembers,
   claimMember,
+  confirmSettlement,
   createGroup,
   createLoan,
   createOrder,
   createPool,
   createSplit,
   getNettedTransfers,
+  recordSettlement,
+  voidEvent,
 } from "../_shared/repo.ts";
 
 function json(body: unknown, status = 200): Response {
@@ -106,6 +109,35 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
           groupId, title: b.title ?? null, payerMemberId: b.payerMemberId, items: b.items,
         });
         return json(out, 201);
+      }
+
+      if (req.method === "POST" && sub === "settlements" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const b = await body();
+        const out = await recordSettlement(db, {
+          groupId,
+          fromMemberId: b.fromMemberId,
+          toMemberId: b.toMemberId,
+          amountCents: b.amountCents,
+          method: b.method,
+          idempotencyKey: b.idempotencyKey,
+        });
+        return json(out, 201);
+      }
+    }
+
+    if (parts[0] === "groups" && parts.length === 5 && req.method === "POST") {
+      const groupId = parts[1];
+      await authorizeGroup(db, groupId, token);
+      if (parts[2] === "settlements" && parts[4] === "confirm") {
+        if (!device) throw new Error("missing device id");
+        await confirmSettlement(db, { groupId, settlementId: parts[3], deviceId: device });
+        return json({ ok: true }, 200);
+      }
+      if (parts[2] === "events" && parts[4] === "void") {
+        if (!device) throw new Error("missing device id");
+        await voidEvent(db, { groupId, eventId: parts[3], deviceId: device });
+        return json({ ok: true }, 200);
       }
     }
 

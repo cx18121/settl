@@ -113,3 +113,59 @@ Deno.test("a split with mismatched shares returns 400", {
     { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 900 }] }, tok), db);
   assertEquals(bad.status, 400);
 });
+
+Deno.test("settlement record + creditor-device confirm over HTTP", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
+  const [a, b] = memberIds;
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: a }, { ...tok, "x-settl-device": "dev-A" }), db);
+  await handle(req("POST", `/groups/${groupId}/splits`,
+    { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
+
+  const settle = await handle(req("POST", `/groups/${groupId}/settlements`,
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo", idempotencyKey: "k1" }, tok), db);
+  assertEquals(settle.status, 201);
+  const { settlementId } = await settle.json();
+
+  const bad = await handle(req("POST", `/groups/${groupId}/settlements/${settlementId}/confirm`, {}, { ...tok, "x-settl-device": "dev-evil" }), db);
+  assertEquals(bad.status, 403);
+
+  const ok = await handle(req("POST", `/groups/${groupId}/settlements/${settlementId}/confirm`, {}, { ...tok, "x-settl-device": "dev-A" }), db);
+  assertEquals(ok.status, 200);
+  const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
+  assertEquals(bal.transfers.length, 0);
+});
+
+Deno.test("POST /settlements without an idempotency key is rejected (400)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
+  const [a, b] = memberIds;
+  await handle(req("POST", `/groups/${groupId}/splits`,
+    { totalCents: 1000, payerMemberId: a, shares: [{ memberId: b, amountCents: 1000 }] }, tok), db);
+  const res = await handle(req("POST", `/groups/${groupId}/settlements`,
+    { fromMemberId: b, toMemberId: a, amountCents: 1000, method: "venmo" }, tok), db);
+  assertEquals(res.status, 400);
+});
+
+Deno.test("void over HTTP requires a claimed member — token alone cannot void", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["A", "B"]);
+  const [a, b] = memberIds;
+  const { eventId } = await (await handle(req("POST", `/groups/${groupId}/splits`,
+    { totalCents: 800, payerMemberId: a, shares: [{ memberId: b, amountCents: 800 }] }, tok), db)).json();
+  const denied = await handle(req("POST", `/groups/${groupId}/events/${eventId}/void`, {}, { ...tok, "x-settl-device": "dev-stranger" }), db);
+  assertEquals(denied.status, 403);
+  const stillOwed = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
+  assertEquals(stillOwed.transfers.length, 1, "debt untouched by rejected void");
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: a }, { ...tok, "x-settl-device": "dev-A" }), db);
+  const ok = await handle(req("POST", `/groups/${groupId}/events/${eventId}/void`, {}, { ...tok, "x-settl-device": "dev-A" }), db);
+  assertEquals(ok.status, 200);
+  const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
+  assertEquals(bal.transfers.length, 0);
+});
