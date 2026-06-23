@@ -4,6 +4,10 @@ import {
   addMembers,
   claimMember,
   createGroup,
+  createLoan,
+  createOrder,
+  createPool,
+  createSplit,
   getNettedTransfers,
 } from "../_shared/repo.ts";
 
@@ -63,6 +67,45 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const transfers = await getNettedTransfers(db, groupId);
         return json({ transfers }, 200);
+      }
+
+      if (req.method === "POST" && sub === "splits" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const b = await body();
+        const out = await createSplit(db, {
+          groupId, title: b.title ?? null, totalCents: b.totalCents,
+          payerMemberId: b.payerMemberId, shares: b.shares,
+        });
+        return json(out, 201);
+      }
+
+      if (req.method === "POST" && sub === "pools" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const b = await body();
+        const out = await createPool(db, {
+          groupId, title: b.title ?? null, targetCents: b.targetCents,
+          organizerMemberId: b.organizerMemberId, contributorMemberIds: b.contributorMemberIds,
+        });
+        return json(out, 201);
+      }
+
+      if (req.method === "POST" && sub === "loans" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const b = await body();
+        const out = await createLoan(db, {
+          groupId, title: b.title ?? null, lenderMemberId: b.lenderMemberId,
+          borrowerMemberId: b.borrowerMemberId, amountCents: b.amountCents,
+        });
+        return json(out, 201);
+      }
+
+      if (req.method === "POST" && sub === "orders" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const b = await body();
+        const out = await createOrder(db, {
+          groupId, title: b.title ?? null, payerMemberId: b.payerMemberId, items: b.items,
+        });
+        return json(out, 201);
       }
     }
 
