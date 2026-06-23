@@ -1,5 +1,3 @@
--- Atomic first-come claim: succeeds only if the seat is unclaimed or already
--- bound to this same device. Parameterized (no filter-string injection).
 create function claim_member(
   p_group_id uuid,
   p_member_id uuid,

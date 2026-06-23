@@ -39,7 +39,7 @@ Deno.test("authorizeGroup passes with the right token, throws otherwise", {
 }, async () => {
   const d = db();
   const { groupId, inviteToken } = await createGroup(d, { title: "x" });
-  await authorizeGroup(d, groupId, inviteToken); // no throw
+  await authorizeGroup(d, groupId, inviteToken);
   let threw = "";
   try { await authorizeGroup(d, groupId, "wrong"); } catch (e) { threw = (e as Error).message; }
   assert(threw.includes("unauthorized"), `expected unauthorized, got: ${threw}`);

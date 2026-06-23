@@ -1,5 +1,3 @@
--- Generalized atomic event+shares writer (supersedes create_split).
--- One transaction: a share failure (e.g. cross-group FK) rolls back the event.
 create function create_event(
   p_group_id uuid,
   p_type text,
