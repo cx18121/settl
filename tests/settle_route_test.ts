@@ -67,6 +67,7 @@ Deno.test("GET /settle renders the owed amount and a correct venmo pay link", {
   assertEquals(res.status, 200);
   assertEquals(res.headers.get("content-type"), "text/html; charset=utf-8");
   assertEquals(res.headers.get("referrer-policy"), "no-referrer");
+  assertEquals(res.headers.get("cache-control"), "no-store");
   const html = await res.text();
   assert(html.includes("You owe Charlie $14.00"));
 

@@ -39,6 +39,7 @@ function html(body: string, status: number): Response {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "referrer-policy": "no-referrer",
+      "cache-control": "no-store",
     },
   });
 }
