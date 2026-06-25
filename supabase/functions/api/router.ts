@@ -1,5 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { authorizeGroup } from "../_shared/auth.ts";
+import { authorizeGroup, authorizeSettleToken } from "../_shared/auth.ts";
+import { buildVenmoPayLink } from "../_shared/venmo.ts";
+import { renderErrorPage, renderSettlePage } from "../_shared/settlePage.ts";
 import {
   addMembers,
   claimMember,
@@ -10,6 +12,7 @@ import {
   createPool,
   createSplit,
   getNettedTransfers,
+  getSettleView,
   recordSettlement,
   voidEvent,
 } from "../_shared/repo.ts";
@@ -28,6 +31,40 @@ function statusForError(message: string): number {
   return 400;
 }
 
+function html(body: string, status: number): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
+async function handleSettle(
+  db: SupabaseClient,
+  groupId: string,
+  memberId: string,
+  token: string | null,
+): Promise<Response> {
+  try {
+    await authorizeSettleToken(db, groupId, memberId, token);
+    const view = await getSettleView(db, groupId, memberId);
+    const debts = view.debts.map((d) => ({
+      creditorName: d.creditorName,
+      amountCents: d.amountCents,
+      payLink: d.venmoHandle
+        ? buildVenmoPayLink({ handle: d.venmoHandle, amountCents: d.amountCents, note: "Settling up via Settl" })
+        : null,
+    }));
+    return html(renderSettlePage({ memberName: view.memberName, debts }), 200);
+  } catch (e) {
+    const message = (e as Error).message;
+    if (/invalid settle link/i.test(message)) return html(renderErrorPage("This settle link isn't valid."), 404);
+    return html(renderErrorPage("Something went wrong. Please try again."), 500);
+  }
+}
+
 export async function handle(req: Request, db: SupabaseClient): Promise<Response> {
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
@@ -36,6 +73,10 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
   const body = async () => (req.body ? await req.json() : {});
 
   try {
+    if (req.method === "GET" && parts[0] === "settle" && parts.length === 3) {
+      return await handleSettle(db, parts[1], parts[2], url.searchParams.get("t"));
+    }
+
     if (req.method === "POST" && parts.length === 1 && parts[0] === "groups") {
       const b = await body();
       const out = await createGroup(db, { title: b.title ?? null });
