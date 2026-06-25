@@ -118,9 +118,9 @@ git commit -m "feat: per-member settle_token column (read-only web-settle creden
 - Test: `tests/venmo_test.ts`
 
 **Interfaces:**
-- Produces: `buildVenmoPayLink(input: { handle: string; amountCents: number; note: string }): string` — returns an `https://venmo.com/?txn=pay&...` URL.
+- Produces: `buildVenmoPayLink(input: { handle: string; amountCents: number; note: string }): string` — returns an `https://venmo.com/<handle>?txn=pay&amount=&note=` URL.
 
-> Venmo publishes no official web-link spec. This mirrors the documented `venmo://paycharge?txn=pay&recipients=&amount=&note=` deep-link params onto the `https://venmo.com/` universal link, with `audience=private`. **Before shipping, confirm this base URL opens a prefilled payment on a real device** (the deep-link params are verified; the HTTPS base is the community-documented convention). The test below asserts parsed components + escaping, so it stays valid regardless of param ordering.
+> **Verified web format** (multiple sources, last confirmed ~2025; Venmo publishes no official spec): the username goes in the PATH — `https://venmo.com/<handle>?txn=pay&amount=<dollars>&note=<encoded>` — with NO `audience` or `recipients` query params (those belong to the `venmo://` scheme). Venmo no longer initiates transactions from desktop browsers, so the prefill works by launching the Venmo app on mobile (our case: debtor taps from iMessage on iPhone); on desktop it lands on Venmo's site without prefill. The handle moves into the path, so it must be normalized (strip a leading `@`) and `encodeURIComponent`-encoded — never interpolated raw. **Before shipping, confirm the link opens a prefilled payment on a real iPhone.** The test asserts parsed components, so it survives param-ordering changes.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -130,16 +130,17 @@ Create `tests/venmo_test.ts`:
 import { assert, assertEquals } from "@std/assert";
 import { buildVenmoPayLink } from "../supabase/functions/_shared/venmo.ts";
 
-Deno.test("builds an https venmo.com pay link with the right components", () => {
+Deno.test("builds an https venmo.com pay link with the handle in the path", () => {
   const link = buildVenmoPayLink({ handle: "charlie-x", amountCents: 1450, note: "Settling up" });
   const u = new URL(link);
   assertEquals(u.protocol, "https:");
   assertEquals(u.host, "venmo.com");
+  assertEquals(u.pathname, "/charlie-x");
   assertEquals(u.searchParams.get("txn"), "pay");
-  assertEquals(u.searchParams.get("audience"), "private");
-  assertEquals(u.searchParams.get("recipients"), "charlie-x");
   assertEquals(u.searchParams.get("amount"), "14.50");
   assertEquals(u.searchParams.get("note"), "Settling up");
+  assertEquals(u.searchParams.get("audience"), null);
+  assertEquals(u.searchParams.get("recipients"), null);
 });
 
 Deno.test("amount renders whole dollars with two decimals", () => {
@@ -147,16 +148,22 @@ Deno.test("amount renders whole dollars with two decimals", () => {
   assertEquals(u.searchParams.get("amount"), "14.00");
 });
 
-Deno.test("special characters in note and handle survive a round-trip (correct escaping)", () => {
+Deno.test("strips a leading @ and path-encodes a hostile handle", () => {
+  const link = buildVenmoPayLink({ handle: "@a/b?c#d", amountCents: 100, note: "n" });
+  const u = new URL(link);
+  assertEquals(u.pathname, "/a%2Fb%3Fc%23d");
+  assert(!link.includes("/a/b"));
+});
+
+Deno.test("special characters in the note survive a round-trip (correct escaping)", () => {
   const note = "a b&c=d?e#f";
-  const u = new URL(buildVenmoPayLink({ handle: "x y&z", amountCents: 100, note }));
+  const u = new URL(buildVenmoPayLink({ handle: "x", amountCents: 100, note }));
   assertEquals(u.searchParams.get("note"), note);
-  assertEquals(u.searchParams.get("recipients"), "x y&z");
   assert(!u.search.includes("c=d"));
 });
 ```
 
-The round-trip `searchParams.get` returning the exact input proves the `&`, `=`, `?`, `#` were percent-encoded; the final assert confirms the note's literal `c=d` did not leak as a separate query param.
+The round-trip `searchParams.get` returning the exact note proves `&`, `=`, `?`, `#` were percent-encoded; the hostile-handle test proves the path segment is encoded so a handle can't inject a new path or query.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -171,14 +178,13 @@ Create `supabase/functions/_shared/venmo.ts`:
 export function buildVenmoPayLink(
   input: { handle: string; amountCents: number; note: string },
 ): string {
+  const handle = input.handle.replace(/^@/, "");
   const params = new URLSearchParams({
     txn: "pay",
-    audience: "private",
-    recipients: input.handle,
     amount: (input.amountCents / 100).toFixed(2),
     note: input.note,
   });
-  return `https://venmo.com/?${params.toString()}`;
+  return `https://venmo.com/${encodeURIComponent(handle)}?${params.toString()}`;
 }
 ```
 
@@ -223,8 +229,13 @@ Deno.test("owed amount renders with a pay button", () => {
     debts: [{ creditorName: "Charlie", amountCents: 1400, payLink: "https://venmo.com/?txn=pay&amount=14.00" }],
   });
   assert(html.includes("You owe Charlie $14.00"));
-  assert(html.includes('href="https://venmo.com/?txn=pay&amp;amount=14.00"'));
+  assert(html.includes('rel="noreferrer" href="https://venmo.com/?txn=pay&amp;amount=14.00"'));
   assert(html.includes("Pay with Venmo"));
+});
+
+Deno.test("the page sets a no-referrer policy so the settle token can't leak to Venmo", () => {
+  const html = renderSettlePage({ memberName: "Jake", debts: [] });
+  assert(html.includes('<meta name="referrer" content="no-referrer">'));
 });
 
 Deno.test("multiple creditors each render a line and a button", () => {
@@ -313,6 +324,7 @@ const STYLE =
 function shell(title: string, body: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<meta name="referrer" content="no-referrer">` +
     `<title>${esc(title)}</title><style>${STYLE}</style></head><body>${body}</body></html>`;
 }
 
@@ -323,7 +335,7 @@ export function renderSettlePage(view: SettlePageView): string {
   const blocks = view.debts.map((d) => {
     const line = `<p>You owe ${esc(d.creditorName)} $${dollars(d.amountCents)}</p>`;
     const action = d.payLink
-      ? `<a class="pay" href="${esc(d.payLink)}">Pay with Venmo</a>`
+      ? `<a class="pay" rel="noreferrer" href="${esc(d.payLink)}">Pay with Venmo</a>`
       : `<p class="no-handle">${esc(d.creditorName)} hasn't added a Venmo handle yet</p>`;
     return `<div class="debt">${line}${action}</div>`;
   }).join("");
@@ -338,7 +350,7 @@ export function renderErrorPage(message: string): string {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `deno test tests/settlePage_test.ts`
-Expected: PASS (6 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -414,6 +426,40 @@ Deno.test("authorizeSettleToken accepts the member's token, rejects a wrong one"
   await assertRejects(() => authorizeSettleToken(db, groupId, memberIds[0], "wrong"));
   await assertRejects(() => authorizeSettleToken(db, groupId, memberIds[0], null));
 });
+
+Deno.test("authorizeSettleToken treats malformed ids as an invalid link (never a DB error)", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  await assertRejects(
+    () => authorizeSettleToken(db, "not-a-uuid", "also-not-a-uuid", "tok"),
+    Error,
+    "invalid settle link",
+  );
+});
+
+Deno.test("getSettleView returns one debt per creditor when a debtor owes several", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId } = await createGroup(db, { title: "t" });
+  const { memberIds } = await addMembers(db, { groupId, names: ["Charlie", "Dana", "Jake"] });
+  const [charlie, dana, jake] = memberIds;
+  await claimMember(db, { groupId, memberId: charlie, deviceId: "dev-C", venmoHandle: "charlie-x" });
+  await claimMember(db, { groupId, memberId: dana, deviceId: "dev-D", venmoHandle: "dana-y" });
+  await createSplit(db, {
+    groupId, title: "a", totalCents: 1000, payerMemberId: charlie,
+    shares: [{ memberId: jake, amountCents: 1000 }],
+  });
+  await createSplit(db, {
+    groupId, title: "b", totalCents: 600, payerMemberId: dana,
+    shares: [{ memberId: jake, amountCents: 600 }],
+  });
+
+  const view = await getSettleView(db, groupId, jake);
+  assertEquals(view.debts.length, 2);
+  assertEquals(view.debts.map((d) => d.creditorName).sort(), ["Charlie", "Dana"]);
+});
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -426,13 +472,17 @@ Expected: FAIL — `authorizeSettleToken` / `getSettleView` not exported.
 Append to `supabase/functions/_shared/auth.ts`:
 
 ```typescript
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function authorizeSettleToken(
   db: SupabaseClient,
   groupId: string,
   memberId: string,
   token: string | null,
 ): Promise<void> {
-  if (!token) throw new Error("invalid settle link");
+  if (!token || !UUID_RE.test(groupId) || !UUID_RE.test(memberId)) {
+    throw new Error("invalid settle link");
+  }
   const { data, error } = await db
     .from("members")
     .select("id")
@@ -444,6 +494,8 @@ export async function authorizeSettleToken(
   if (!data) throw new Error("invalid settle link");
 }
 ```
+
+The UUID pre-check matters: `groupId`/`memberId` are `uuid` columns, so a malformed path id makes Postgres raise `invalid input syntax for type uuid` — that would surface as a generic query error and map to a 500 page. Validating the shape first turns a bad link into the intended `"invalid settle link"` → 404.
 
 - [ ] **Step 4: Add `getSettleView` to `repo.ts`**
 
@@ -474,16 +526,18 @@ export async function getSettleView(
   const { data: creditors, error: cErr } = await db
     .from("members")
     .select("id, display_name, venmo_handle")
+    .eq("group_id", groupId)
     .in("id", mine.map((t) => t.toMemberId));
   if (cErr) throw new Error(`getSettleView: ${cErr.message}`);
   const byId = new Map((creditors ?? []).map((c) => [c.id, c]));
 
   const debts = mine.map((t) => {
     const c = byId.get(t.toMemberId);
+    if (!c) throw new Error(`getSettleView: creditor ${t.toMemberId} not found in group`);
     return {
-      creditorName: (c?.display_name as string) ?? "someone",
+      creditorName: c.display_name as string,
       amountCents: t.amountCents,
-      venmoHandle: (c?.venmo_handle as string | null) ?? null,
+      venmoHandle: (c.venmo_handle as string | null) ?? null,
     };
   });
   return { memberName: me.display_name as string, debts };
@@ -493,7 +547,7 @@ export async function getSettleView(
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settle_view_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS (3 tests in the file).
+Expected: PASS (5 tests in the file).
 
 - [ ] **Step 6: Commit**
 
@@ -534,7 +588,7 @@ async function settleToken(memberId: string): Promise<string> {
   return data!.settle_token as string;
 }
 
-async function jsonReq(method: string, path: string, body: unknown, headers: Record<string, string> = {}) {
+function jsonReq(method: string, path: string, body: unknown, headers: Record<string, string> = {}) {
   return new Request(`http://x${path}`, {
     method,
     headers: { "content-type": "application/json", ...headers },
@@ -570,7 +624,7 @@ async function seed(claimCreditorHandle: string | null) {
   return { groupId: made.groupId, charlie, jake };
 }
 
-Deno.test("GET /settle renders the owed amount and a venmo link", {
+Deno.test("GET /settle renders the owed amount and a correct venmo pay link", {
   sanitizeResources: false,
   sanitizeOps: false,
 }, async () => {
@@ -579,9 +633,65 @@ Deno.test("GET /settle renders the owed amount and a venmo link", {
   const res = await handle(req("GET", `/settle/${groupId}/${jake}?t=${t}`), db);
   assertEquals(res.status, 200);
   assertEquals(res.headers.get("content-type"), "text/html; charset=utf-8");
+  assertEquals(res.headers.get("referrer-policy"), "no-referrer");
   const html = await res.text();
   assert(html.includes("You owe Charlie $14.00"));
-  assert(html.includes("venmo.com"));
+
+  const m = html.match(/href="([^"]+)"/);
+  assert(m, "a pay link should be present");
+  const pay = new URL(m![1].replaceAll("&amp;", "&"));
+  assertEquals(pay.host, "venmo.com");
+  assertEquals(pay.pathname, "/charlie-x");
+  assertEquals(pay.searchParams.get("txn"), "pay");
+  assertEquals(pay.searchParams.get("amount"), "14.00");
+  assert((pay.searchParams.get("note") ?? "").length > 0);
+});
+
+Deno.test("GET /settle renders one pay link per creditor when a debtor owes several", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const made = await (await handle(jsonReq("POST", "/groups", { title: "t" }), db)).json();
+  const tok = { "x-settl-token": made.inviteToken };
+  const { memberIds } = await (await handle(
+    jsonReq("POST", `/groups/${made.groupId}/members`, { names: ["Charlie", "Dana", "Jake"] }, tok),
+    db,
+  )).json();
+  const [charlie, dana, jake] = memberIds;
+  await handle(jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: charlie, venmoHandle: "charlie-x" }, { ...tok, "x-settl-device": "dev-C" }), db);
+  await handle(jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: dana, venmoHandle: "dana-y" }, { ...tok, "x-settl-device": "dev-D" }), db);
+  await handle(jsonReq("POST", `/groups/${made.groupId}/splits`, { totalCents: 1000, payerMemberId: charlie, shares: [{ memberId: jake, amountCents: 1000 }] }, tok), db);
+  await handle(jsonReq("POST", `/groups/${made.groupId}/splits`, { totalCents: 600, payerMemberId: dana, shares: [{ memberId: jake, amountCents: 600 }] }, tok), db);
+
+  const t = await settleToken(jake);
+  const html = await (await handle(req("GET", `/settle/${made.groupId}/${jake}?t=${t}`), db)).text();
+  assert(html.includes("You owe Charlie $10.00"));
+  assert(html.includes("You owe Dana $6.00"));
+  assertEquals(html.match(/href="/g)?.length, 2, "one pay button per creditor");
+});
+
+Deno.test("GET /settle with a malformed group/member id returns 404, not 500", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const res = await handle(req("GET", `/settle/not-a-uuid/also-bad?t=whatever`), db);
+  assertEquals(res.status, 404);
+  assertEquals(res.headers.get("content-type"), "text/html; charset=utf-8");
+});
+
+Deno.test("GET /settle reflects a voided event — a voided debt shows settled up", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, jake } = await seed("charlie-x");
+  const { data: g } = await db.from("groups").select("invite_token").eq("id", groupId).single();
+  const { data: ev } = await db.from("events").select("id").eq("group_id", groupId).single();
+  const auth = { "x-settl-token": g!.invite_token as string, "x-settl-device": "dev-C" };
+  await handle(jsonReq("POST", `/groups/${groupId}/events/${ev!.id}/void`, {}, auth), db);
+  const t = await settleToken(jake);
+  const html = await (await handle(req("GET", `/settle/${groupId}/${jake}?t=${t}`), db)).text();
+  assert(html.includes("settled up"));
+  assert(!html.includes("href="));
 });
 
 Deno.test("GET /settle with a bad token returns a 404 html page", {
@@ -643,7 +753,13 @@ Add `handleSettle` above `handle`:
 
 ```typescript
 function html(body: string, status: number): Response {
-  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 
 async function handleSettle(
@@ -682,7 +798,7 @@ Add the route branch at the top of the `try` block in `handle`, before the `grou
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno test tests/settle_route_test.ts --allow-env --allow-net --allow-read`
-Expected: PASS (4 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -712,7 +828,7 @@ Run:
 ```
 SUPABASE_SERVICE_ROLE_KEY="$(supabase status -o env | grep SERVICE_ROLE_KEY | cut -d= -f2 | tr -d '\"')" deno task test
 ```
-Expected: PASS — all prior suites (63) plus the new venmo (3) + settlePage (6) + settle_view (3) + settle_route (4) tests.
+Expected: PASS — all prior suites (63) plus the new venmo (4) + settlePage (7) + settle_view (5) + settle_route (7) tests = 86 total.
 
 - [ ] **Step 3: Format check**
 

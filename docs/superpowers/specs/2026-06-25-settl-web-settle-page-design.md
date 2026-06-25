@@ -56,9 +56,11 @@ A pure function in `_shared/`:
 buildVenmoPayLink({ handle, amountCents, note }) -> string
 ```
 
-Returns the escaped `https://venmo.com/...` universal pay link (opens the Venmo app if installed, else browser/app-store — per the parent spec's "No Venmo installed" edge case). The debtor pays the creditor, so the intent is `txn=pay` to the creditor's handle, amount in dollars, with a note such as *"Settling up via Settl"*.
+Returns the escaped `https://venmo.com/<handle>?txn=pay&amount=<dollars>&note=<note>` link. The verified web format (multiple sources, last confirmed ~2025; Venmo publishes no official spec) puts the **handle in the path** with no `audience`/`recipients` query params (those belong to the `venmo://` scheme). The debtor pays the creditor, so `txn=pay`, amount in dollars, note such as *"Settling up via Settl"*. The handle is normalized (leading `@` stripped) and `encodeURIComponent`-encoded into the path, never interpolated raw.
 
-The exact query-param spelling is verified against Venmo's live link docs immediately before the builder is written — not from memory. The unit test asserts against that verified format.
+**Desktop limitation:** Venmo no longer initiates transactions from its desktop website, so the prefill works by launching the Venmo app — which happens on mobile (our case: the debtor taps the link from iMessage on their iPhone). On a desktop browser the link lands on Venmo's site without a prefilled payment. Acceptable for v1; confirm the prefill on a real iPhone before shipping.
+
+The unit test asserts parsed components (path, `txn`, `amount`, encoded `note`) and escaping, not a brittle exact string.
 
 ## Rendering
 
@@ -68,10 +70,12 @@ A pure `renderSettlePage(view)` returns a self-contained HTML string: inline `<s
 
 The settle route returns **HTML**, not JSON, because a human reads it:
 
-- Bad or missing token, unknown group/member → `404 text/html` with a short "this link isn't valid" page.
+- Bad or missing token, **malformed (non-UUID) group/member id**, unknown group/member → `404 text/html` with a short "this link isn't valid" page. (The id columns are `uuid`; a malformed id is shape-validated before any query so it becomes a 404, not a Postgres-error 500.)
 - Unexpected server error → `500 text/html` with a short generic message.
 
 The existing JSON routes in the router are unchanged; only the settle route branch produces HTML.
+
+**Token must not leak via Referer.** The page URL carries `?t=<settleToken>`. Every settle response sets `Referrer-Policy: no-referrer` (header + a `<meta name="referrer">` fallback), and the Venmo link carries `rel="noreferrer"`, so clicking through to Venmo does not send the token in a `Referer` header.
 
 ## Components (each independently testable)
 
@@ -99,3 +103,4 @@ The existing JSON routes in the router are unchanged; only the settle route bran
 - **Pool progress visualization** on the web page — Plan 4 territory.
 - **SwiftUI iMessage extension** and the chase-reminder UI that *generates* the link — Plan 4. (Plan 3 builds the page the link points to; the extension that inserts the link is later.)
 - **Rate limiting / abuse protection** beyond the per-member token — revisit before public exposure.
+- **Deployment precondition (not built here, but load-bearing):** the security model assumes the edge function is the *only* DB client and Postgres is reached service-role-only. If Supabase's public Data API (PostgREST) is ever exposed with anon access, `settle_token` stops being secret (it would be queryable directly). Before any public deployment, verify anon/public API access to `members` is disabled. RLS is intentionally not used (consistent with the rest of the backend).
