@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { assertSharesSumTo, equalSplit } from "./splitMath.ts";
-import { netPositions, type EventRow, type ShareRow, type SettlementRow } from "./balances.ts";
+import { type EventRow, netPositions, type SettlementRow, type ShareRow } from "./balances.ts";
 import { minimalTransfers } from "./netting.ts";
 import type { Transfer } from "./types.ts";
 
@@ -104,7 +104,9 @@ export async function recordSettlement(
     .limit(1)
     .maybeSingle();
   if (aErr) throw new Error(`recordSettlement auth: ${aErr.message}`);
-  if (!actor) throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+  if (!actor) {
+    throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+  }
 
   const { data: existing, error: iErr } = await db
     .from("settlements")
@@ -378,4 +380,45 @@ export async function voidEvent(
     .select("id");
   if (error) throw new Error(`voidEvent: ${error.message}`);
   if (!data || data.length === 0) throw new Error("no active event found to void");
+}
+
+export interface SettleViewData {
+  memberName: string;
+  debts: { creditorName: string; amountCents: number; venmoHandle: string | null }[];
+}
+
+export async function getSettleView(
+  db: SupabaseClient,
+  groupId: string,
+  memberId: string,
+): Promise<SettleViewData> {
+  const { data: me, error: meErr } = await db
+    .from("members")
+    .select("display_name")
+    .eq("group_id", groupId)
+    .eq("id", memberId)
+    .single();
+  if (meErr) throw new Error(`getSettleView: ${meErr.message}`);
+
+  const mine = (await getNettedTransfers(db, groupId)).filter((t) => t.fromMemberId === memberId);
+  if (mine.length === 0) return { memberName: me.display_name as string, debts: [] };
+
+  const { data: creditors, error: cErr } = await db
+    .from("members")
+    .select("id, display_name, venmo_handle")
+    .eq("group_id", groupId)
+    .in("id", mine.map((t) => t.toMemberId));
+  if (cErr) throw new Error(`getSettleView: ${cErr.message}`);
+  const byId = new Map((creditors ?? []).map((c) => [c.id, c]));
+
+  const debts = mine.map((t) => {
+    const c = byId.get(t.toMemberId);
+    if (!c) throw new Error(`getSettleView: creditor ${t.toMemberId} not found in group`);
+    return {
+      creditorName: c.display_name as string,
+      amountCents: t.amountCents,
+      venmoHandle: (c.venmo_handle as string | null) ?? null,
+    };
+  });
+  return { memberName: me.display_name as string, debts };
 }
