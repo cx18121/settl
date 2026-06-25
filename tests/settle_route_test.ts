@@ -13,7 +13,12 @@ async function settleToken(memberId: string): Promise<string> {
   return data!.settle_token as string;
 }
 
-function jsonReq(method: string, path: string, body: unknown, headers: Record<string, string> = {}) {
+function jsonReq(
+  method: string,
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+) {
   return new Request(`http://x${path}`, {
     method,
     headers: { "content-type": "application/json", ...headers },
@@ -31,7 +36,10 @@ async function seed(claimCreditorHandle: string | null) {
   const [charlie, jake] = memberIds;
   if (claimCreditorHandle) {
     await handle(
-      jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: charlie, venmoHandle: claimCreditorHandle }, {
+      jsonReq("POST", `/groups/${made.groupId}/claim`, {
+        memberId: charlie,
+        venmoHandle: claimCreditorHandle,
+      }, {
         ...tok,
         "x-settl-device": "dev-C",
       }),
@@ -83,13 +91,40 @@ Deno.test("GET /settle renders one pay link per creditor when a debtor owes seve
     db,
   )).json();
   const [charlie, dana, jake] = memberIds;
-  await handle(jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: charlie, venmoHandle: "charlie-x" }, { ...tok, "x-settl-device": "dev-C" }), db);
-  await handle(jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: dana, venmoHandle: "dana-y" }, { ...tok, "x-settl-device": "dev-D" }), db);
-  await handle(jsonReq("POST", `/groups/${made.groupId}/splits`, { totalCents: 1000, payerMemberId: charlie, shares: [{ memberId: jake, amountCents: 1000 }] }, tok), db);
-  await handle(jsonReq("POST", `/groups/${made.groupId}/splits`, { totalCents: 600, payerMemberId: dana, shares: [{ memberId: jake, amountCents: 600 }] }, tok), db);
+  await handle(
+    jsonReq("POST", `/groups/${made.groupId}/claim`, {
+      memberId: charlie,
+      venmoHandle: "charlie-x",
+    }, { ...tok, "x-settl-device": "dev-C" }),
+    db,
+  );
+  await handle(
+    jsonReq("POST", `/groups/${made.groupId}/claim`, { memberId: dana, venmoHandle: "dana-y" }, {
+      ...tok,
+      "x-settl-device": "dev-D",
+    }),
+    db,
+  );
+  await handle(
+    jsonReq("POST", `/groups/${made.groupId}/splits`, {
+      totalCents: 1000,
+      payerMemberId: charlie,
+      shares: [{ memberId: jake, amountCents: 1000 }],
+    }, tok),
+    db,
+  );
+  await handle(
+    jsonReq("POST", `/groups/${made.groupId}/splits`, {
+      totalCents: 600,
+      payerMemberId: dana,
+      shares: [{ memberId: jake, amountCents: 600 }],
+    }, tok),
+    db,
+  );
 
   const t = await settleToken(jake);
-  const html = await (await handle(req("GET", `/settle/${made.groupId}/${jake}?t=${t}`), db)).text();
+  const html = await (await handle(req("GET", `/settle/${made.groupId}/${jake}?t=${t}`), db))
+    .text();
   assert(html.includes("You owe Charlie $10.00"));
   assert(html.includes("You owe Dana $6.00"));
   assertEquals(html.match(/href="/g)?.length, 2, "one pay button per creditor");

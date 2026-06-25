@@ -4,7 +4,11 @@ import { renderErrorPage, renderSettlePage } from "../supabase/functions/_shared
 Deno.test("owed amount renders with a pay button", () => {
   const html = renderSettlePage({
     memberName: "Jake",
-    debts: [{ creditorName: "Charlie", amountCents: 1400, payLink: "https://venmo.com/?txn=pay&amount=14.00" }],
+    debts: [{
+      creditorName: "Charlie",
+      amountCents: 1400,
+      payLink: "https://venmo.com/?txn=pay&amount=14.00",
+    }],
   });
   assert(html.includes("You owe Charlie $14.00"));
   assert(html.includes('rel="noreferrer" href="https://venmo.com/?txn=pay&amp;amount=14.00"'));

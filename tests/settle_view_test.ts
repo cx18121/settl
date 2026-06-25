@@ -3,11 +3,7 @@ import { makeDb } from "../supabase/functions/_shared/db.ts";
 import { addMembers, createGroup } from "../supabase/functions/_shared/repo.ts";
 import { assertEquals, assertRejects } from "@std/assert";
 import { authorizeSettleToken } from "../supabase/functions/_shared/auth.ts";
-import {
-  claimMember,
-  createSplit,
-  getSettleView,
-} from "../supabase/functions/_shared/repo.ts";
+import { claimMember, createSplit, getSettleView } from "../supabase/functions/_shared/repo.ts";
 
 const db = makeDb();
 
@@ -35,7 +31,12 @@ Deno.test("getSettleView returns the member's debts with creditor name + handle"
   const { groupId } = await createGroup(db, { title: "t" });
   const { memberIds } = await addMembers(db, { groupId, names: ["Charlie", "Jake"] });
   const [charlie, jake] = memberIds;
-  await claimMember(db, { groupId, memberId: charlie, deviceId: "dev-C", venmoHandle: "charlie-x" });
+  await claimMember(db, {
+    groupId,
+    memberId: charlie,
+    deviceId: "dev-C",
+    venmoHandle: "charlie-x",
+  });
   await createSplit(db, {
     groupId,
     title: "din",
@@ -85,14 +86,25 @@ Deno.test("getSettleView returns one debt per creditor when a debtor owes severa
   const { groupId } = await createGroup(db, { title: "t" });
   const { memberIds } = await addMembers(db, { groupId, names: ["Charlie", "Dana", "Jake"] });
   const [charlie, dana, jake] = memberIds;
-  await claimMember(db, { groupId, memberId: charlie, deviceId: "dev-C", venmoHandle: "charlie-x" });
+  await claimMember(db, {
+    groupId,
+    memberId: charlie,
+    deviceId: "dev-C",
+    venmoHandle: "charlie-x",
+  });
   await claimMember(db, { groupId, memberId: dana, deviceId: "dev-D", venmoHandle: "dana-y" });
   await createSplit(db, {
-    groupId, title: "a", totalCents: 1000, payerMemberId: charlie,
+    groupId,
+    title: "a",
+    totalCents: 1000,
+    payerMemberId: charlie,
     shares: [{ memberId: jake, amountCents: 1000 }],
   });
   await createSplit(db, {
-    groupId, title: "b", totalCents: 600, payerMemberId: dana,
+    groupId,
+    title: "b",
+    totalCents: 600,
+    payerMemberId: dana,
     shares: [{ memberId: jake, amountCents: 600 }],
   });
 

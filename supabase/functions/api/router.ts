@@ -26,7 +26,9 @@ function json(body: unknown, status = 200): Response {
 
 function statusForError(message: string): number {
   if (/unauthorized|creditor's device/i.test(message)) return 403;
-  if (/already claimed|pending settlement already exists|different payment details/i.test(message)) return 409;
+  if (
+    /already claimed|pending settlement already exists|different payment details/i.test(message)
+  ) return 409;
   if (/not found|no active event|no proposed settlement/i.test(message)) return 404;
   return 400;
 }
@@ -54,13 +56,19 @@ async function handleSettle(
       creditorName: d.creditorName,
       amountCents: d.amountCents,
       payLink: d.venmoHandle
-        ? buildVenmoPayLink({ handle: d.venmoHandle, amountCents: d.amountCents, note: "Settling up via Settl" })
+        ? buildVenmoPayLink({
+          handle: d.venmoHandle,
+          amountCents: d.amountCents,
+          note: "Settling up via Settl",
+        })
         : null,
     }));
     return html(renderSettlePage({ memberName: view.memberName, debts }), 200);
   } catch (e) {
     const message = (e as Error).message;
-    if (/invalid settle link/i.test(message)) return html(renderErrorPage("This settle link isn't valid."), 404);
+    if (/invalid settle link/i.test(message)) {
+      return html(renderErrorPage("This settle link isn't valid."), 404);
+    }
     return html(renderErrorPage("Something went wrong. Please try again."), 500);
   }
 }
@@ -117,8 +125,11 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const b = await body();
         const out = await createSplit(db, {
-          groupId, title: b.title ?? null, totalCents: b.totalCents,
-          payerMemberId: b.payerMemberId, shares: b.shares,
+          groupId,
+          title: b.title ?? null,
+          totalCents: b.totalCents,
+          payerMemberId: b.payerMemberId,
+          shares: b.shares,
         });
         return json(out, 201);
       }
@@ -127,8 +138,11 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const b = await body();
         const out = await createPool(db, {
-          groupId, title: b.title ?? null, targetCents: b.targetCents,
-          organizerMemberId: b.organizerMemberId, contributorMemberIds: b.contributorMemberIds,
+          groupId,
+          title: b.title ?? null,
+          targetCents: b.targetCents,
+          organizerMemberId: b.organizerMemberId,
+          contributorMemberIds: b.contributorMemberIds,
         });
         return json(out, 201);
       }
@@ -137,8 +151,11 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const b = await body();
         const out = await createLoan(db, {
-          groupId, title: b.title ?? null, lenderMemberId: b.lenderMemberId,
-          borrowerMemberId: b.borrowerMemberId, amountCents: b.amountCents,
+          groupId,
+          title: b.title ?? null,
+          lenderMemberId: b.lenderMemberId,
+          borrowerMemberId: b.borrowerMemberId,
+          amountCents: b.amountCents,
         });
         return json(out, 201);
       }
@@ -147,7 +164,10 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const b = await body();
         const out = await createOrder(db, {
-          groupId, title: b.title ?? null, payerMemberId: b.payerMemberId, items: b.items,
+          groupId,
+          title: b.title ?? null,
+          payerMemberId: b.payerMemberId,
+          items: b.items,
         });
         return json(out, 201);
       }

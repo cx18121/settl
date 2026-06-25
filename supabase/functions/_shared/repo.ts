@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { assertSharesSumTo, equalSplit } from "./splitMath.ts";
-import { netPositions, type EventRow, type ShareRow, type SettlementRow } from "./balances.ts";
+import { type EventRow, netPositions, type SettlementRow, type ShareRow } from "./balances.ts";
 import { minimalTransfers } from "./netting.ts";
 import type { Transfer } from "./types.ts";
 
@@ -104,7 +104,9 @@ export async function recordSettlement(
     .limit(1)
     .maybeSingle();
   if (aErr) throw new Error(`recordSettlement auth: ${aErr.message}`);
-  if (!actor) throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+  if (!actor) {
+    throw new Error("unauthorized: settlement must be recorded by the debtor or creditor");
+  }
 
   const { data: existing, error: iErr } = await db
     .from("settlements")
