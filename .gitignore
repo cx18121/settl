@@ -9,3 +9,5 @@ node_modules/
 supabase/.temp
 ios/Settl.xcodeproj/
 ios/**/*.xcodeproj/
+ios/SettlKit/.build/
+ios/build/
