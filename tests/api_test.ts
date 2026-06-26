@@ -185,3 +185,14 @@ Deno.test("void over HTTP requires a claimed member — token alone cannot void"
   const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
   assertEquals(bal.transfers.length, 0);
 });
+
+Deno.test("routes resolve under a /functions/v1/api prefix", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const made = await (await handle(req("POST", "/functions/v1/api/groups", { title: "t" }), db)).json();
+  assert(made.groupId && made.inviteToken);
+  const tok = { "x-settl-token": made.inviteToken };
+  const bal = await handle(req("GET", `/functions/v1/api/groups/${made.groupId}/balances`, undefined, tok), db);
+  assertEquals(bal.status, 200);
+});
