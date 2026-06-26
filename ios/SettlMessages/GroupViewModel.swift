@@ -27,8 +27,10 @@ final class GroupViewModel: ObservableObject {
         do {
             async let m = client.members(groupId: groupId)
             async let t = client.balances(groupId: groupId)
-            members = try await m
-            transfers = try await t
+            let loadedMembers = try await m
+            let loadedTransfers = try await t
+            members = loadedMembers
+            transfers = loadedTransfers
         } catch let error as APIError {
             errorMessage = message(for: error)
         } catch {
@@ -38,13 +40,16 @@ final class GroupViewModel: ObservableObject {
     }
 
     func claim(_ memberId: String) async {
+        loading = true
         do {
             try await client.claim(groupId: groupId, memberId: memberId)
             await load()
         } catch let error as APIError {
             errorMessage = message(for: error)
+            loading = false
         } catch {
             errorMessage = "Network error. Tap to retry."
+            loading = false
         }
     }
 

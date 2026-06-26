@@ -15,13 +15,12 @@ struct ConnectView: View {
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
             Button("Connect") {
-                onConnect(Connection(
-                    groupId: groupId.trimmingCharacters(in: .whitespaces),
-                    inviteToken: inviteToken.trimmingCharacters(in: .whitespaces),
-                ))
+                let trimmedGroupId = groupId.trimmingCharacters(in: .whitespaces)
+                let trimmedInviteToken = inviteToken.trimmingCharacters(in: .whitespaces)
+                onConnect(Connection(groupId: trimmedGroupId, inviteToken: trimmedInviteToken))
             }
             .buttonStyle(.borderedProminent)
-            .disabled(groupId.isEmpty || inviteToken.isEmpty)
+            .disabled(groupId.trimmingCharacters(in: .whitespaces).isEmpty || inviteToken.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding()
     }

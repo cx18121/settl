@@ -40,7 +40,7 @@ struct GroupView: View {
             if !model.transfers.isEmpty {
                 Divider()
                 Text("Balances").font(.subheadline.bold())
-                ForEach(model.transfers, id: \.fromMemberId) { t in
+                ForEach(Array(model.transfers.enumerated()), id: \.offset) { _, t in
                     Text("\(t.fromMemberId) owes \(t.toMemberId): $\(String(format: "%.2f", Double(t.amountCents) / 100))")
                         .font(.caption)
                 }
