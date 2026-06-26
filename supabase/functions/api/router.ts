@@ -13,6 +13,7 @@ import {
   createSplit,
   getNettedTransfers,
   getSettleView,
+  listMembers,
   recordSettlement,
   voidEvent,
 } from "../_shared/repo.ts";
@@ -122,6 +123,12 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const transfers = await getNettedTransfers(db, groupId);
         return json({ transfers }, 200);
+      }
+
+      if (req.method === "GET" && sub === "members" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const members = await listMembers(db, groupId);
+        return json(members, 200);
       }
 
       if (req.method === "POST" && sub === "splits" && parts.length === 3) {
