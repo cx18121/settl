@@ -7,3 +7,5 @@ node_modules/
 .branches
 .temp
 supabase/.temp
+ios/Settl.xcodeproj/
+ios/**/*.xcodeproj/
