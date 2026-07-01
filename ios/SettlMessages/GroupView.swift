@@ -41,12 +41,16 @@ struct GroupView: View {
                 Divider()
                 Text("Balances").font(.subheadline.bold())
                 ForEach(Array(model.transfers.enumerated()), id: \.offset) { _, t in
-                    Text("\(t.fromMemberId) owes \(t.toMemberId): $\(String(format: "%.2f", Double(t.amountCents) / 100))")
+                    Text("\(name(t.fromMemberId)) owes \(name(t.toMemberId)): $\(String(format: "%.2f", Double(t.amountCents) / 100))")
                         .font(.caption)
                 }
             }
         }
         .padding()
         .task { await model.load() }
+    }
+
+    private func name(_ id: String) -> String {
+        model.members.first { $0.id == id }?.displayName ?? id
     }
 }
