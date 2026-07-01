@@ -13,6 +13,7 @@ import {
   createSplit,
   getNettedTransfers,
   getSettleView,
+  listMembers,
   recordSettlement,
   voidEvent,
 } from "../_shared/repo.ts";
@@ -76,7 +77,9 @@ async function handleSettle(
 
 export async function handle(req: Request, db: SupabaseClient): Promise<Response> {
   const url = new URL(req.url);
-  const parts = url.pathname.split("/").filter(Boolean);
+  const rawParts = url.pathname.split("/").filter(Boolean);
+  const apiIdx = rawParts.lastIndexOf("api");
+  const parts = apiIdx >= 0 ? rawParts.slice(apiIdx + 1) : rawParts;
   const token = req.headers.get("x-settl-token");
   const device = req.headers.get("x-settl-device");
   const body = async () => (req.body ? await req.json() : {});
@@ -120,6 +123,12 @@ export async function handle(req: Request, db: SupabaseClient): Promise<Response
         await authorizeGroup(db, groupId, token);
         const transfers = await getNettedTransfers(db, groupId);
         return json({ transfers }, 200);
+      }
+
+      if (req.method === "GET" && sub === "members" && parts.length === 3) {
+        await authorizeGroup(db, groupId, token);
+        const members = await listMembers(db, groupId);
+        return json(members, 200);
       }
 
       if (req.method === "POST" && sub === "splits" && parts.length === 3) {

@@ -422,3 +422,20 @@ export async function getSettleView(
   });
   return { memberName: me.display_name as string, debts };
 }
+
+export async function listMembers(
+  db: SupabaseClient,
+  groupId: string,
+): Promise<{ id: string; displayName: string; claimed: boolean }[]> {
+  const { data, error } = await db
+    .from("members")
+    .select("id, display_name, claimed")
+    .eq("group_id", groupId)
+    .order("created_at", { ascending: true });
+  if (error) throw new Error(`listMembers: ${error.message}`);
+  return (data ?? []).map((m) => ({
+    id: m.id as string,
+    displayName: m.display_name as string,
+    claimed: m.claimed as boolean,
+  }));
+}

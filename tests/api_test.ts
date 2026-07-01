@@ -185,3 +185,35 @@ Deno.test("void over HTTP requires a claimed member — token alone cannot void"
   const bal = await (await handle(req("GET", `/groups/${groupId}/balances`, undefined, tok), db)).json();
   assertEquals(bal.transfers.length, 0);
 });
+
+Deno.test("routes resolve under a /functions/v1/api prefix", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const made = await (await handle(req("POST", "/functions/v1/api/groups", { title: "t" }), db)).json();
+  assert(made.groupId && made.inviteToken);
+  const tok = { "x-settl-token": made.inviteToken };
+  const bal = await handle(req("GET", `/functions/v1/api/groups/${made.groupId}/balances`, undefined, tok), db);
+  assertEquals(bal.status, 200);
+});
+
+Deno.test("GET /groups/:id/members lists seats with claimed state, token-gated", {
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  const { groupId, tok, memberIds } = await makeGroupWithMembers(["Charlie", "Jake"]);
+  await handle(req("POST", `/groups/${groupId}/claim`, { memberId: memberIds[0] }, { ...tok, "x-settl-device": "dev-C" }), db);
+
+  const noTok = await handle(req("GET", `/groups/${groupId}/members`), db);
+  assertEquals(noTok.status, 403);
+
+  const res = await handle(req("GET", `/groups/${groupId}/members`, undefined, tok), db);
+  assertEquals(res.status, 200);
+  const members = await res.json();
+  assertEquals(members.length, 2);
+  const charlie = members.find((m: { displayName: string }) => m.displayName === "Charlie");
+  const jake = members.find((m: { displayName: string }) => m.displayName === "Jake");
+  assertEquals(charlie.claimed, true);
+  assertEquals(jake.claimed, false);
+  assertEquals(Object.keys(charlie).sort(), ["claimed", "displayName", "id"]);
+});

@@ -1,0 +1,46 @@
+name: Settl
+options:
+  bundleIdPrefix: com.charliexue
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SUPPORTED_PLATFORMS: iphoneos iphonesimulator
+packages:
+  SettlKit:
+    path: SettlKit
+targets:
+  Settl:
+    type: application
+    platform: iOS
+    sources: [Settl]
+    info:
+      path: Settl/Info.plist
+      properties:
+        UILaunchScreen: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.charliexue.settl
+    dependencies:
+      - target: SettlMessages
+        embed: true
+    scheme: {}
+  SettlMessages:
+    type: app-extension.messages
+    platform: iOS
+    sources: [SettlMessages]
+    info:
+      path: SettlMessages/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.message-payload-provider
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).MessagesViewController
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.charliexue.settl.messages
+    dependencies:
+      - package: SettlKit
+        product: SettlKit
+    scheme: {}
