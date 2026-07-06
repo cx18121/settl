@@ -6,8 +6,6 @@ iMessage app for settling up and chasing group money. See `docs/superpowers/spec
 - `supabase start` — local Postgres + Studio
 - `deno task test` — run all tests
 
-## API (Plan 2)
-
 A single Supabase edge function (`supabase/functions/api`) serves the ledger over HTTP. Run locally:
 
 ```
