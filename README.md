@@ -1,7 +1,6 @@
 # Settl
 
-An iMessage app for settling up with friends. It tracks shared expenses, works out who owes who,
-and links to Venmo for payments.
+An iMessage app for tracking shared expenses and settling up through Venmo.
 
 ## Project layout
 
@@ -16,9 +15,9 @@ and links to Venmo for payments.
 
 ### Backend
 
-You'll need Deno, the Supabase CLI, and Docker or a compatible runtime.
+Requires Deno, the Supabase CLI, and Docker or a compatible runtime.
 
-From the repo root:
+Run from the repo root:
 
 ```sh
 supabase start
@@ -29,14 +28,14 @@ The API runs at `http://127.0.0.1:54321/functions/v1/api`. Auth uses group invit
 
 ### Tests
 
-Ledger tests, no database needed:
+Run the ledger tests without a database:
 
 ```sh
 deno task test:unit
 ```
 
-For the full suite, keep local Supabase running and open another terminal. Get the local
-service-role key from `supabase status`:
+The full suite runs against local Supabase. In a separate terminal, set the service-role key
+from `supabase status`:
 
 ```sh
 export SUPABASE_URL="http://127.0.0.1:54321"
@@ -44,19 +43,20 @@ export SUPABASE_SERVICE_ROLE_KEY="<local service_role key>"
 deno task test
 ```
 
-If you use a `.env` file, load it into your shell first. The test task doesn't load it automatically.
+Load any `.env` file into the shell before running tests. The test task does not load it automatically.
 
 ### iOS
 
-With Xcode and XcodeGen installed:
+Requires Xcode and XcodeGen. Generate and open the project:
 
 ```sh
 (cd ios && xcodegen generate)
 open ios/Settl.xcodeproj
 ```
 
-The Simulator uses the local backend by default. For a physical device, change the URL in
-`ios/SettlKit/Sources/SettlKit/Config.swift` and set your signing team and bundle identifiers in Xcode.
+The iOS Simulator uses the local backend by default. Physical device builds require a reachable
+backend URL in `ios/SettlKit/Sources/SettlKit/Config.swift` and a signing team and bundle identifiers
+configured in Xcode.
 
 Run the Swift package tests with `swift test --package-path ios/SettlKit`.
 
