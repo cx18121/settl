@@ -3,9 +3,6 @@
 An iMessage app for settling up with friends. It tracks shared expenses, works out who owes who,
 and links to Venmo for payments.
 
-Built with SwiftUI and Supabase. The backend handles the ledger and web settlement pages. So far,
-the iMessage extension lets you connect to a group, claim your name, and check balances.
-
 ## Project layout
 
 - `ios/Settl`: host app
@@ -83,5 +80,3 @@ recording or confirming a settlement, and voiding an event also use `x-settl-dev
 | POST | `/groups/:gid/settlements/:sid/confirm` | Confirm receipt as the creditor |
 | POST | `/groups/:gid/events/:eid/void` | Void an event as a claimed member |
 | GET | `/settle/:groupId/:memberId?t=<settleToken>` | View a read-only settlement page |
-
-Settlement links use a separate token for each member.
