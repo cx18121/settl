@@ -1,48 +1,45 @@
 # Settl
 
-An iMessage app for tracking shared expenses and settling up with friends.
+An iMessage app for settling up with friends. It tracks shared expenses, works out who owes who,
+and links to Venmo for payments.
 
-The backend tracks group balances, reduces debts to a set of payments, and serves read-only
-settlement pages with Venmo links. The iMessage extension currently supports connecting to an
-existing group, claiming a member, and viewing balances. Settl does not move money itself.
-
-This is a work in progress for local development, not a production-ready service.
+Built with SwiftUI and Supabase. The backend handles the ledger and web settlement pages. So far,
+the iMessage extension lets you connect to a group, claim your name, and check balances.
 
 ## Project layout
 
-- `ios/Settl` contains the host app.
-- `ios/SettlMessages` contains the iMessage extension.
-- `ios/SettlKit` contains the Swift API client and models.
-- `supabase/functions` contains the TypeScript API and ledger logic.
-- `supabase/migrations` contains the database schema and functions.
-- `tests` contains the backend tests.
+- `ios/Settl`: host app
+- `ios/SettlMessages`: iMessage extension
+- `ios/SettlKit`: Swift API client and models
+- `supabase/functions`: TypeScript API and ledger logic
+- `supabase/migrations`: database schema and functions
+- `tests`: backend tests
 
 ## Local development
 
 ### Backend
 
-Install Deno and the Supabase CLI. Supabase's local stack also needs a Docker-compatible runtime.
-Run these commands from the repository root.
+You'll need Deno, the Supabase CLI, and Docker or a compatible runtime.
+
+From the repo root:
 
 ```sh
 supabase start
 supabase functions serve api --no-verify-jwt
 ```
 
-The API is available at `http://127.0.0.1:54321/functions/v1/api`. It uses group invite tokens and
-device IDs rather than Supabase user JWTs.
+The API runs at `http://127.0.0.1:54321/functions/v1/api`. Auth uses group invite tokens and device IDs.
 
 ### Tests
 
-The pure ledger tests do not need a database.
+Ledger tests, no database needed:
 
 ```sh
 deno task test:unit
 ```
 
-The full backend suite writes test data. Use only a disposable local Supabase instance, never a
-production database. In a separate terminal, use the local service-role key shown by
-`supabase status`.
+For the full suite, keep local Supabase running and open another terminal. Get the local
+service-role key from `supabase status`:
 
 ```sh
 export SUPABASE_URL="http://127.0.0.1:54321"
@@ -50,22 +47,19 @@ export SUPABASE_SERVICE_ROLE_KEY="<local service_role key>"
 deno task test
 ```
 
-Keep credentials in your environment or an ignored `.env` file. Do not commit them. Deno tasks do
-not automatically load `.env` files.
+If you use a `.env` file, load it into your shell first. The test task doesn't load it automatically.
 
 ### iOS
 
-Install Xcode and XcodeGen, then generate the Xcode project.
+With Xcode and XcodeGen installed:
 
 ```sh
 (cd ios && xcodegen generate)
 open ios/Settl.xcodeproj
 ```
 
-The API client defaults to the local backend on `127.0.0.1`, suitable for the iOS Simulator. A
-physical device needs a reachable backend URL configured in
-`ios/SettlKit/Sources/SettlKit/Config.swift`. Configure your own signing team and bundle identifiers
-for device builds.
+The Simulator uses the local backend by default. For a physical device, change the URL in
+`ios/SettlKit/Sources/SettlKit/Config.swift` and set your signing team and bundle identifiers in Xcode.
 
 Run the Swift package tests with `swift test --package-path ios/SettlKit`.
 
@@ -90,12 +84,4 @@ recording or confirming a settlement, and voiding an event also use `x-settl-dev
 | POST | `/groups/:gid/events/:eid/void` | Void an event as a claimed member |
 | GET | `/settle/:groupId/:memberId?t=<settleToken>` | View a read-only settlement page |
 
-Settlement links use a separate per-member token, not the group invite token. Treat both kinds of
-links as private.
-
-## Before deployment
-
-Publishing the source does not make the backend safe to expose. The current migrations do not
-enable row-level security. The backend assumes database access is restricted to its service role.
-Before deploying, restrict direct Data API access to ledger tables and functions, verify that
-unauthenticated clients cannot read or mutate them, and keep service-role credentials server-side.
+Settlement links use a separate token for each member.
